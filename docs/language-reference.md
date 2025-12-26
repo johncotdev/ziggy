@@ -18,8 +18,9 @@ Ziggy DBL is a Zig implementation of the Synergy DBL programming language, featu
 8. [ISAM Database Operations](#isam-database-operations)
 9. [Built-in Functions](#built-in-functions)
 10. [XCALL Subroutines](#xcall-subroutines)
-11. [Comments](#comments)
-12. [Examples](#examples)
+11. [Bytecode Compilation](#bytecode-compilation)
+12. [Comments](#comments)
+13. [Examples](#examples)
 
 ---
 
@@ -567,6 +568,160 @@ xcall ISAMC(filespec, record_size, num_keys, key_spec, ...)
 ```
 
 Creates a new ISAM file with the specified key definitions.
+
+---
+
+## Bytecode Compilation
+
+Ziggy DBL supports compiling programs to bytecode for portable, faster execution.
+
+### Execution Modes
+
+| Mode | Description | Use Case |
+|------|-------------|----------|
+| Interpreter | Direct AST execution | Development, debugging |
+| Bytecode VM | Compiled bytecode execution | Production, distribution |
+
+### Compiling to Bytecode
+
+```bash
+# Compile a DBL source file to bytecode
+ziggy --compile program.dbl -o program.zbc
+
+# Compile with debug info
+ziggy --compile --debug program.dbl -o program.zbc
+```
+
+### Running Bytecode
+
+```bash
+# Execute a compiled bytecode file
+ziggy --run program.zbc
+
+# Or simply (auto-detects .zbc extension)
+ziggy program.zbc
+```
+
+### Bytecode File Format
+
+Compiled files use the `.zbc` extension (Ziggy Bytecode):
+
+| Section | Contents |
+|---------|----------|
+| Header | Magic "ZBC1", version, flags |
+| Constants | String pool, numeric constants |
+| Types | Record definitions |
+| Routines | Subroutine/function metadata |
+| Code | Bytecode instructions |
+| Debug | Line numbers (optional) |
+
+### Disassembling Bytecode
+
+For debugging, you can view the bytecode as human-readable assembly:
+
+```bash
+ziggy --disasm program.zbc
+```
+
+**Example output:**
+```
+; Ziggy DBL Bytecode Disassembly
+; Version: 0.1
+; Entry Point: 0x0000
+
+; === Constants (3) ===
+;   [0000] id(tt)
+;   [0001] str("Hello, World!")
+;   [0002] id(message)
+
+; === Code (16 bytes) ===
+  0000:  20 00 00        load_global @0        ; tt
+  0003:  08 01 00        push_const #1         ; "Hello, World!"
+  0006:  86 01           ch_display argc=1
+  0008:  FF              halt
+```
+
+### Creating Libraries
+
+Libraries are compiled bytecode modules that can be loaded at runtime:
+
+```bash
+# Compile a library module
+ziggy --compile --library mylib.dbl -o mylib.zbl
+
+# Use library in another program
+ziggy --link mylib.zbl program.dbl
+```
+
+Library files use the `.zbl` extension (Ziggy Bytecode Library).
+
+### Virtual Machine
+
+The bytecode VM is a stack-based interpreter with:
+
+- **Operand Stack**: Expression evaluation
+- **Global Variables**: Module-level data
+- **Local Variables**: Per-routine storage
+- **Call Stack**: Subroutine invocation
+
+### Opcodes Overview
+
+The VM supports 100+ opcodes organized by category:
+
+| Category | Examples |
+|----------|----------|
+| Stack | `push_i8`, `pop`, `dup` |
+| Variables | `load_global`, `store_local` |
+| Arithmetic | `add`, `sub`, `mul`, `div` |
+| Comparison | `cmp_eq`, `cmp_lt` |
+| Control Flow | `jump`, `jump_if_false`, `call` |
+| I/O | `ch_open`, `ch_display` |
+| ISAM | `isam_read`, `isam_store` |
+| Strings | `str_concat`, `str_trim` |
+| Built-ins | `fn_abs`, `fn_date` |
+
+### Performance Comparison
+
+| Feature | Interpreter | Bytecode VM |
+|---------|-------------|-------------|
+| Startup | Faster (no compile) | Slower (load module) |
+| Execution | Slower (AST walk) | Faster (dispatch loop) |
+| Memory | Higher (AST in memory) | Lower (compact bytecode) |
+| Debugging | Full source access | Requires debug info |
+
+### Best Practices
+
+1. **Development**: Use interpreter for quick iteration
+2. **Testing**: Compile with debug info for stack traces
+3. **Production**: Compile without debug for smaller files
+4. **Distribution**: Ship `.zbc` files, not source
+
+### Example: Compile and Run
+
+```dbl
+; hello.dbl
+record
+    tt      ,i4
+endrecord
+
+proc
+    open(tt, "O", "tt:")
+    display(tt, "Hello from bytecode!")
+    close(tt)
+end
+```
+
+```bash
+# Compile
+ziggy --compile hello.dbl -o hello.zbc
+
+# Run
+ziggy hello.zbc
+# Output: Hello from bytecode!
+
+# Disassemble
+ziggy --disasm hello.zbc
+```
 
 ---
 
