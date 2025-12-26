@@ -12,8 +12,7 @@ zig-out/
 # OS files
 .DS_Store
 Thumbs.db
-*.is1
-*.ism
+*.zdb
 *.zbc
 *.pdf
 /sde-manuals

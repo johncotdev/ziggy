@@ -12,42 +12,63 @@ ISAM files provide:
 
 ## File Structure
 
-Each ISAM database consists of two files:
+Ziggy ISAM uses a single-file database format (.zdb) for atomic operations and easy deployment:
 
-| File | Extension | Contents |
-|------|-----------|----------|
-| Index | .ism | B+ tree index structure |
-| Data | .is1 | Record data storage |
+| Extension | Contents |
+|-----------|----------|
+| .zdb | Header, key definitions, B+ tree index, record data |
 
-### Index File Format (.ism)
+### Database File Format (.zdb)
+
+```
+┌─────────────────────────────────────────┐
+│ Header (256 bytes)                      │
+│ - Magic, version, key count, etc.       │
+├─────────────────────────────────────────┤
+│ Key Definitions (variable)              │
+├─────────────────────────────────────────┤
+│ Index Region (B-tree entries)           │
+├─────────────────────────────────────────┤
+│ Data Region (ULID + records)            │
+└─────────────────────────────────────────┘
+```
+
+### Header Layout
 
 ```
 Offset  Size    Field
 ------  ----    -----
-0       8       Magic "ZIGGYIDX"
-8       4       Version (1)
-12      4       Block size (4096)
+0       8       Magic "ZIGGYDB\0"
+8       4       Version (2)
+12      4       Page size (4096)
 16      2       Key count
 18      2       Flags
-20      8       Root block offset
-28      8       Record count
-36      ...     Key definitions
-4096    ...     B+ tree blocks
+20      8       Record count
+28      4       Record size
+32      1       Record type (0=fixed)
+33      3       Padding
+36      8       Key defs offset
+44      8       Key defs size
+52      8       Index offset
+60      8       Index size
+68      8       Data offset
+76      8       Free list head
+84-255  ...     Reserved
 ```
 
-### Data File Format (.is1)
+### Record Storage
+
+Each record is stored with a database-managed ULID:
 
 ```
-Offset  Size    Field
-------  ----    -----
-0       8       Magic "ZIGGYDAT"
-8       4       Version (1)
-12      1       Record type (0=fixed)
-13      4       Record size
-17      8       Free list head
-25      8       Record count
-33      ...     Record data
+[ULID 16 bytes][length 4 bytes][record data]
 ```
+
+ULIDs (Universally Unique Lexicographically Sortable Identifiers) provide:
+- Human-readable 26-character identifiers (Crockford Base32)
+- Lexicographically sortable by creation time
+- URL-safe characters
+- Globally unique across systems
 
 ## Creating ISAM Files
 
@@ -265,15 +286,34 @@ Ziggy ISAM uses a B+ tree for indexing:
 - Self-balancing on insert/delete
 - Efficient range queries
 
-### Record File Address (RFA)
+### Record Identifiers
 
-Each record is identified by an RFA:
+Each record has two types of identifiers:
 
+**ULID (Universally Unique Lexicographically Sortable Identifier)**
+- 26-character human-readable string
+- Automatically generated on STORE
+- Accessible via GETRFA qualifier
+- Read directly via RFA qualifier
+
+**RFA (Record File Address)**
+- Internal 64-bit address (48-bit block + 16-bit offset)
+- Used internally for B-tree pointers
+- This allows addressing up to 2^48 blocks for massive file capacity
+
+**Example: Using ULIDs**
+```dbl
+record
+    ulid    ,a26        ; Storage for record ULID
+endrecord
+
+; Store and get ULID
+store(ch, product, GETRFA:ulid)
+display(tt, "Record ULID: ", ulid)
+
+; Later, read directly by ULID
+read(ch, product, ulid, RFA)
 ```
-48-bit block number + 16-bit offset = 64-bit address
-```
-
-This allows addressing up to 2^48 blocks, each 4KB, for massive file capacity.
 
 ## Sequential Access
 
