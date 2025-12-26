@@ -1,0 +1,140 @@
+; composite_key_demo.dbl - Composite Key Demo for Ziggy DBL
+;
+; Demonstrates composite (multi-segment) keys in ISAM:
+; - Creating keys from multiple non-contiguous record fields
+; - Using START=pos1:pos2, LENGTH=len1:len2 syntax
+; - Example: Indexing orders by (customer_id + order_date) composite key
+
+record order
+    order_id    ,a8     ; Primary key (bytes 1-8)
+    cust_id     ,a8     ; Customer ID (bytes 9-16)
+    order_date  ,a8     ; Date YYYYMMDD (bytes 17-24)
+    amount      ,d10    ; Order amount (bytes 25-34)
+    status      ,a10    ; Order status (bytes 35-44)
+endrecord
+
+record
+    tt          ,i4     ; Terminal channel
+    ch          ,i4     ; ISAM file channel
+endrecord
+
+proc
+    ; Open terminal
+    open(tt, "O", "tt:")
+
+    display(tt, "=== Ziggy Composite Key Demo ===")
+    display(tt, "")
+
+    ; Create ISAM file with composite key on (cust_id + order_date)
+    ; Key 0: order_id (primary) - single segment
+    ; Key 1: cust_id + order_date (composite) - two segments for customer order history
+    ; Record size = 8 + 8 + 8 + 10 + 10 = 44 bytes
+    xcall ISAMC("orders", 44, 2, "START=1, LENGTH=8, TYPE=ALPHA", "START=9:17, LENGTH=8:8, TYPE=ALPHA:ALPHA, DUPS")
+    display(tt, "Created ISAM file: orders")
+    display(tt, "  Key 0: order_id (primary)")
+    display(tt, "  Key 1: cust_id + order_date (composite, duplicates allowed)")
+    display(tt, "")
+
+    ; Open ISAM file
+    open(ch, "U:I", "orders")
+    display(tt, "Opened ISAM file: orders")
+    display(tt, "")
+
+    ; Store orders for multiple customers on different dates
+    ; Customer CUST0001 orders
+    order_id = "ORD00001"
+    cust_id = "CUST0001"
+    order_date = "20241215"
+    amount = 500
+    status = "SHIPPED"
+    store(ch, order)
+    display(tt, "Stored: ", order_id, " - ", cust_id, " ", order_date, " $", amount)
+
+    order_id = "ORD00004"
+    cust_id = "CUST0001"
+    order_date = "20241220"
+    amount = 250
+    status = "PENDING"
+    store(ch, order)
+    display(tt, "Stored: ", order_id, " - ", cust_id, " ", order_date, " $", amount)
+
+    ; Customer CUST0002 orders
+    order_id = "ORD00002"
+    cust_id = "CUST0002"
+    order_date = "20241210"
+    amount = 1200
+    status = "DELIVERED"
+    store(ch, order)
+    display(tt, "Stored: ", order_id, " - ", cust_id, " ", order_date, " $", amount)
+
+    order_id = "ORD00005"
+    cust_id = "CUST0002"
+    order_date = "20241218"
+    amount = 800
+    status = "SHIPPED"
+    store(ch, order)
+    display(tt, "Stored: ", order_id, " - ", cust_id, " ", order_date, " $", amount)
+
+    ; Customer CUST0003 order
+    order_id = "ORD00003"
+    cust_id = "CUST0003"
+    order_date = "20241212"
+    amount = 350
+    status = "PENDING"
+    store(ch, order)
+    display(tt, "Stored: ", order_id, " - ", cust_id, " ", order_date, " $", amount)
+
+    display(tt, "")
+    display(tt, "--- Sequential Read by PRIMARY KEY (order_id) ---")
+
+    ; Read by primary key order (ORD00001..ORD00005)
+    reads(ch, order)
+    display(tt, "  ", order_id, " | ", cust_id, " | ", order_date, " | $", amount, " | ", status)
+
+    reads(ch, order)
+    display(tt, "  ", order_id, " | ", cust_id, " | ", order_date, " | $", amount, " | ", status)
+
+    reads(ch, order)
+    display(tt, "  ", order_id, " | ", cust_id, " | ", order_date, " | $", amount, " | ", status)
+
+    reads(ch, order)
+    display(tt, "  ", order_id, " | ", cust_id, " | ", order_date, " | $", amount, " | ", status)
+
+    reads(ch, order)
+    display(tt, "  ", order_id, " | ", cust_id, " | ", order_date, " | $", amount, " | ", status)
+
+    display(tt, "")
+    display(tt, "--- Sequential Read by COMPOSITE KEY (cust_id + order_date) ---")
+    display(tt, "    Orders grouped by customer, then sorted by date")
+    display(tt, "")
+
+    ; Read by composite key order - should group by customer, then date
+    ; Expected order:
+    ;   CUST0001 20241215 (ORD00001)
+    ;   CUST0001 20241220 (ORD00004)
+    ;   CUST0002 20241210 (ORD00002)
+    ;   CUST0002 20241218 (ORD00005)
+    ;   CUST0003 20241212 (ORD00003)
+    reads(ch, order) [KEYNUM:1]
+    display(tt, "  ", cust_id, " | ", order_date, " | ", order_id, " | $", amount, " | ", status)
+
+    reads(ch, order) [KEYNUM:1]
+    display(tt, "  ", cust_id, " | ", order_date, " | ", order_id, " | $", amount, " | ", status)
+
+    reads(ch, order) [KEYNUM:1]
+    display(tt, "  ", cust_id, " | ", order_date, " | ", order_id, " | $", amount, " | ", status)
+
+    reads(ch, order) [KEYNUM:1]
+    display(tt, "  ", cust_id, " | ", order_date, " | ", order_id, " | $", amount, " | ", status)
+
+    reads(ch, order) [KEYNUM:1]
+    display(tt, "  ", cust_id, " | ", order_date, " | ", order_id, " | $", amount, " | ", status)
+
+    ; Close
+    close(ch)
+    display(tt, "")
+    display(tt, "ISAM file closed.")
+    display(tt, "=== Demo Complete ===")
+    close(tt)
+
+end

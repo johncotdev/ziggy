@@ -438,8 +438,32 @@ pub const IsamFile = struct {
         lock_mode: LockMode = .no_lock,
     };
 
-    /// Read next sequential record
+    /// Set the current key for sequential reads
+    /// Resets position to start of that key's index
+    pub fn setCurrentKey(self: *Self, key_number: u8) void {
+        if (key_number != self.current_key) {
+            self.current_key = key_number;
+            self.current_rfa = null;
+            self.current_node = null;
+            self.current_position = 0;
+        }
+    }
+
+    /// Read next sequential record (optionally by key number)
     pub fn readNext(self: *Self, record_buf: []u8) IsamError!usize {
+        return self.readNextByKey(self.current_key, record_buf);
+    }
+
+    /// Read next sequential record using specified key
+    pub fn readNextByKey(self: *Self, key_number: u8, record_buf: []u8) IsamError!usize {
+        // If key changed, reset position to start of new key's index
+        if (key_number != self.current_key) {
+            self.current_key = key_number;
+            self.current_rfa = null;
+            self.current_node = null; // Reset B-tree position
+            self.current_position = 0;
+        }
+
         // Get next RFA from current position in index
         // If no current position, getNextRfa starts from beginning
         const next_rfa = try self.getNextRfa(self.current_key, self.current_rfa);

@@ -772,7 +772,17 @@ pub const Runtime = struct {
                 try self.storeRecordValue(read_stmt.record, record_buf[0..len]);
             } else {
                 // Sequential read (READS)
-                const len = isam_file.readNext(&record_buf) catch |err| {
+                // Check for KEYNUM qualifier
+                var key_number: u8 = 0;
+                for (read_stmt.qualifiers) |qual| {
+                    if (std.mem.eql(u8, qual.name, "KEYNUM")) {
+                        if (qual.value) |v| {
+                            key_number = @intCast((try self.evaluateExpression(v)).toInteger());
+                        }
+                    }
+                }
+
+                const len = isam_file.readNextByKey(key_number, &record_buf) catch |err| {
                     return switch (err) {
                         isam.IsamError.EndOfFile => RuntimeError.KeyNotFound,
                         else => RuntimeError.FileNotOpen,

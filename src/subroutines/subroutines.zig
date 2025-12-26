@@ -271,6 +271,7 @@ fn native_isamc(ctx: *SubroutineContext) SubroutineError!?Value {
 }
 
 /// Parse key specification string
+/// Supports composite keys with array syntax: START=1:16, LENGTH=8:8, TYPE=ALPHA:NOCASE
 fn parseKeySpec(allocator: std.mem.Allocator, spec: []const u8, key_num: u8) !struct {
     segments: []@import("../isam/isam.zig").KeyDef.KeySegment,
     allow_dups: bool,
@@ -278,45 +279,132 @@ fn parseKeySpec(allocator: std.mem.Allocator, spec: []const u8, key_num: u8) !st
 } {
     const isam = @import("../isam/isam.zig");
 
-    var start: u16 = 0;
-    var length: u16 = 0;
+    // Arrays for composite key segments (max 16 segments per key)
+    var starts: [16]u32 = undefined;
+    var lengths: [16]u32 = undefined;
+    var types: [16]isam.KeyType = undefined;
+    var start_count: usize = 0;
+    var length_count: usize = 0;
+    var type_count: usize = 0;
+
     var allow_dups = false;
     var modifiable = true;
     _ = key_num;
 
-    // Parse "START=n, LENGTH=n, ..." format
+    // Parse "START=n[:n...], LENGTH=n[:n...], TYPE=x[:x...], ..." format
     var iter = std.mem.splitAny(u8, spec, ", ");
     while (iter.next()) |part| {
         const trimmed = std.mem.trim(u8, part, " \t");
         if (trimmed.len == 0) continue;
 
-        if (std.mem.startsWith(u8, trimmed, "START=")) {
-            start = std.fmt.parseInt(u16, trimmed[6..], 10) catch 0;
-            if (start > 0) start -= 1; // Convert to 0-based
-        } else if (std.mem.startsWith(u8, trimmed, "LENGTH=")) {
-            length = std.fmt.parseInt(u16, trimmed[7..], 10) catch 0;
-        } else if (std.mem.eql(u8, std.ascii.upperString(@constCast(trimmed), trimmed), "DUPS")) {
+        // Convert to uppercase for comparison
+        var upper_buf: [64]u8 = undefined;
+        const upper = std.ascii.upperString(&upper_buf, trimmed);
+
+        if (std.mem.startsWith(u8, upper, "START=")) {
+            // Parse array of start positions (colon-separated)
+            const value_part = trimmed[6..];
+            start_count = parseIntArray(value_part, &starts);
+            // Convert from 1-based to 0-based indexing
+            for (starts[0..start_count]) |*s| {
+                if (s.* > 0) s.* -= 1;
+            }
+        } else if (std.mem.startsWith(u8, upper, "LENGTH=")) {
+            // Parse array of lengths (colon-separated)
+            const value_part = trimmed[7..];
+            length_count = parseIntArray(value_part, &lengths);
+        } else if (std.mem.startsWith(u8, upper, "TYPE=")) {
+            // Parse array of types (colon-separated)
+            const value_part = trimmed[5..];
+            type_count = parseTypeArray(value_part, &types);
+        } else if (std.mem.eql(u8, upper[0..@min(upper.len, 4)], "DUPS")) {
             allow_dups = true;
-        } else if (std.mem.eql(u8, std.ascii.upperString(@constCast(trimmed), trimmed), "NOMODIFY")) {
+        } else if (std.mem.eql(u8, upper[0..@min(upper.len, 8)], "NOMODIFY")) {
             modifiable = false;
         }
     }
 
-    if (length == 0) return error.InvalidArgument;
+    // Determine segment count (use max of start/length counts, default to 1)
+    var seg_count = @max(start_count, length_count);
+    if (seg_count == 0) seg_count = 1;
 
-    // Create single segment
-    const segments = try allocator.alloc(isam.KeyDef.KeySegment, 1);
-    segments[0] = .{
-        .start = start,
-        .length = length,
-        .key_type = .alpha,
-    };
+    if (seg_count > 0 and length_count == 0) return error.InvalidArgument;
+
+    // Validate that we have matching counts or can extend with defaults
+    // If lengths provided but starts missing, error
+    if (length_count > 0 and start_count == 0) {
+        // Default start positions (consecutive from 0)
+        var pos: u32 = 0;
+        for (0..length_count) |i| {
+            starts[i] = pos;
+            pos += lengths[i];
+        }
+        start_count = length_count;
+    }
+
+    // Create segments
+    const segments = try allocator.alloc(isam.KeyDef.KeySegment, seg_count);
+    errdefer allocator.free(segments);
+
+    for (0..seg_count) |i| {
+        segments[i] = .{
+            .start = if (i < start_count) starts[i] else 0,
+            .length = if (i < length_count) lengths[i] else 0,
+            .key_type = if (i < type_count) types[i] else .alpha,
+        };
+
+        // Validate length is non-zero
+        if (segments[i].length == 0) {
+            allocator.free(segments);
+            return error.InvalidArgument;
+        }
+    }
 
     return .{
         .segments = segments,
         .allow_dups = allow_dups,
         .modifiable = modifiable,
     };
+}
+
+/// Parse a colon-separated list of integers
+fn parseIntArray(value: []const u8, out: []u32) usize {
+    var count: usize = 0;
+    var iter = std.mem.splitScalar(u8, value, ':');
+    while (iter.next()) |num_str| {
+        if (count >= out.len) break;
+        const trimmed = std.mem.trim(u8, num_str, " \t");
+        out[count] = std.fmt.parseInt(u32, trimmed, 10) catch 0;
+        count += 1;
+    }
+    return count;
+}
+
+/// Parse a colon-separated list of key types
+fn parseTypeArray(value: []const u8, out: []@import("../isam/isam.zig").KeyType) usize {
+    const isam = @import("../isam/isam.zig");
+    var count: usize = 0;
+    var iter = std.mem.splitScalar(u8, value, ':');
+    while (iter.next()) |type_str| {
+        if (count >= out.len) break;
+        const trimmed = std.mem.trim(u8, type_str, " \t");
+        var upper_buf: [16]u8 = undefined;
+        const upper = std.ascii.upperString(&upper_buf, trimmed);
+
+        out[count] = if (std.mem.eql(u8, upper[0..@min(upper.len, 6)], "NOCASE"))
+            isam.KeyType.nocase
+        else if (std.mem.eql(u8, upper[0..@min(upper.len, 7)], "DECIMAL"))
+            isam.KeyType.decimal
+        else if (std.mem.eql(u8, upper[0..@min(upper.len, 7)], "INTEGER"))
+            isam.KeyType.integer
+        else if (std.mem.eql(u8, upper[0..@min(upper.len, 6)], "PACKED"))
+            isam.KeyType.packed_decimal
+        else
+            isam.KeyType.alpha;
+
+        count += 1;
+    }
+    return count;
 }
 
 /// ISUTL - ISAM utility functions
@@ -421,4 +509,49 @@ test "subroutine registry init" {
     const isamc = registry.lookup("isamc");
     try std.testing.expect(isamc != null);
     try std.testing.expectEqual(SubroutineType.native, isamc.?.sub_type);
+}
+
+test "parseKeySpec single segment" {
+    const allocator = std.testing.allocator;
+
+    // Simple single segment key
+    const result = try parseKeySpec(allocator, "START=1, LENGTH=8, TYPE=ALPHA", 0);
+    defer allocator.free(result.segments);
+
+    try std.testing.expectEqual(@as(usize, 1), result.segments.len);
+    try std.testing.expectEqual(@as(u32, 0), result.segments[0].start); // 1-based to 0-based
+    try std.testing.expectEqual(@as(u32, 8), result.segments[0].length);
+    try std.testing.expect(!result.allow_dups);
+    try std.testing.expect(result.modifiable);
+}
+
+test "parseKeySpec composite key" {
+    const allocator = std.testing.allocator;
+
+    // Composite key with two segments
+    const result = try parseKeySpec(allocator, "START=1:16, LENGTH=8:8, TYPE=ALPHA:NOCASE", 0);
+    defer allocator.free(result.segments);
+
+    try std.testing.expectEqual(@as(usize, 2), result.segments.len);
+
+    // First segment: position 0, length 8, alpha
+    try std.testing.expectEqual(@as(u32, 0), result.segments[0].start);
+    try std.testing.expectEqual(@as(u32, 8), result.segments[0].length);
+    try std.testing.expectEqual(@import("../isam/isam.zig").KeyType.alpha, result.segments[0].key_type);
+
+    // Second segment: position 15, length 8, nocase
+    try std.testing.expectEqual(@as(u32, 15), result.segments[1].start);
+    try std.testing.expectEqual(@as(u32, 8), result.segments[1].length);
+    try std.testing.expectEqual(@import("../isam/isam.zig").KeyType.nocase, result.segments[1].key_type);
+}
+
+test "parseKeySpec with dups and nomodify" {
+    const allocator = std.testing.allocator;
+
+    const result = try parseKeySpec(allocator, "START=1, LENGTH=10, DUPS, NOMODIFY", 1);
+    defer allocator.free(result.segments);
+
+    try std.testing.expectEqual(@as(usize, 1), result.segments.len);
+    try std.testing.expect(result.allow_dups);
+    try std.testing.expect(!result.modifiable);
 }

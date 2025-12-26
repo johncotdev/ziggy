@@ -235,9 +235,9 @@ pub const Disassembler = struct {
         switch (c) {
             .integer => |v| try self.writer.print("int({})", .{v}),
             .decimal => |d| try self.writer.print("dec({}, prec={})", .{ d.value, d.precision }),
-            .string => |s| try self.writer.print("str(\"{}\")", .{std.zig.fmtEscapes(s)}),
-            .alpha => |a| try self.writer.print("alpha({}, size={})", .{ std.zig.fmtEscapes(a.data), a.size }),
-            .identifier => |s| try self.writer.print("id({})", .{std.zig.fmtEscapes(s)}),
+            .string => |s| try self.writer.print("str(\"{s}\")", .{s}),
+            .alpha => |a| try self.writer.print("alpha(\"{s}\", size={})", .{ a.data, a.size }),
+            .identifier => |s| try self.writer.print("id(\"{s}\")", .{s}),
             .record_ref => |r| try self.writer.print("record#{}", .{r}),
             .routine_ref => |r| try self.writer.print("routine#{}", .{r}),
         }

@@ -1,16 +1,16 @@
 ; isam_demo.dbl - ISAM Database Demo for Ziggy DBL
 ;
 ; Demonstrates ISAM file operations:
-; - Creating ISAM files with XCALL ISAMC
+; - Creating ISAM files with multiple keys using XCALL ISAMC
 ; - Opening ISAM files (mode "U:I" for Update+ISAM)
 ; - Storing records
-; - Reading by key
-; - Sequential reads
+; - Reading by primary key (cust_id)
+; - Sequential reads by secondary key (cust_name) with KEYNUM qualifier
 ; - Using channel variables (SynergyDE style)
 
 record customer
-    cust_id     ,a8     ; Key field (first 8 bytes)
-    cust_name   ,a30
+    cust_id     ,a8     ; Key 0: Primary key (bytes 1-8)
+    cust_name   ,a30    ; Key 1: Secondary key (bytes 9-38), allows duplicates
     balance     ,d10
 endrecord
 
@@ -23,51 +23,84 @@ proc
     ; Open terminal for display output
     open(tt, "O", "tt:")
 
-    display(tt, "=== Ziggy ISAM Database Demo ===")
+    display(tt, "=== Ziggy ISAM Database Demo (Multi-Key) ===")
     display(tt, "")
 
-    ; Create ISAM file with XCALL ISAMC
-    ; ISAMC(file_spec, rec_size, num_keys, key_spec)
+    ; Create ISAM file with 2 keys using SynergyDE-compatible syntax:
+    ; Key 0 (primary): cust_id at position 1, length 8
+    ; Key 1 (alternate): cust_name at position 9, length 30, DUPS allowed
     ; Record size = 8 + 30 + 10 = 48 bytes
-    ; Key: START=1, LENGTH=8 (cust_id field)
-    xcall ISAMC("customers", 48, 1, "START=1, LENGTH=8, TYPE=ALPHA")
+    xcall ISAMC("customers", 48, 2, "START=1, LENGTH=8, TYPE=ALPHA", "START=9, LENGTH=30, TYPE=NOCASE, DUPS")
     display(tt, "Created ISAM file: customers")
+    display(tt, "  Key 0: cust_id (primary, unique)")
+    display(tt, "  Key 1: cust_name (alternate, duplicates allowed)")
+    display(tt, "")
 
     ; Open ISAM file for update
     open(ch, "U:I", "customers")
     display(tt, "Opened ISAM file: customers")
+    display(tt, "")
 
-    ; Store some customer records
+    ; Store some customer records (note: names NOT in alphabetical order by cust_id)
     cust_id = "CUST0001"
-    cust_name = "Alice Smith"
+    cust_name = "Zara Thompson"
     balance = 1500
     store(ch, customer)
     display(tt, "Stored: ", cust_id, " - ", cust_name)
 
     cust_id = "CUST0002"
-    cust_name = "Bob Johnson"
+    cust_name = "Alice Smith"
     balance = 2300
     store(ch, customer)
     display(tt, "Stored: ", cust_id, " - ", cust_name)
 
     cust_id = "CUST0003"
-    cust_name = "Carol Williams"
+    cust_name = "Bob Johnson"
     balance = 980
     store(ch, customer)
     display(tt, "Stored: ", cust_id, " - ", cust_name)
 
+    cust_id = "CUST0004"
+    cust_name = "Carol Williams"
+    balance = 4200
+    store(ch, customer)
+    display(tt, "Stored: ", cust_id, " - ", cust_name)
+
     display(tt, "")
-    display(tt, "--- Sequential Read (Key Order) ---")
+    display(tt, "--- Sequential Read by PRIMARY KEY (cust_id order) ---")
 
-    ; Read sequentially through all records
+    ; Read sequentially through all records using default key (0)
     reads(ch, customer)
-    display(tt, "Record 1: ", cust_id, " - ", cust_name, " Balance: ", balance)
-
-    reads(ch, customer)
-    display(tt, "Record 2: ", cust_id, " - ", cust_name, " Balance: ", balance)
+    display(tt, "  ", cust_id, " - ", cust_name, " Balance: ", balance)
 
     reads(ch, customer)
-    display(tt, "Record 3: ", cust_id, " - ", cust_name, " Balance: ", balance)
+    display(tt, "  ", cust_id, " - ", cust_name, " Balance: ", balance)
+
+    reads(ch, customer)
+    display(tt, "  ", cust_id, " - ", cust_name, " Balance: ", balance)
+
+    reads(ch, customer)
+    display(tt, "  ", cust_id, " - ", cust_name, " Balance: ", balance)
+
+    display(tt, "")
+    display(tt, "--- Sequential Read by ALTERNATE KEY (cust_name order) ---")
+    display(tt, "    (Using KEYNUM:1 qualifier)")
+    display(tt, "")
+
+    ; Read sequentially using key 1 (cust_name)
+    ; Should return records in alphabetical order by name:
+    ; Alice Smith, Bob Johnson, Carol Williams, Zara Thompson
+    reads(ch, customer) [KEYNUM:1]
+    display(tt, "  ", cust_id, " - ", cust_name, " Balance: ", balance)
+
+    reads(ch, customer) [KEYNUM:1]
+    display(tt, "  ", cust_id, " - ", cust_name, " Balance: ", balance)
+
+    reads(ch, customer) [KEYNUM:1]
+    display(tt, "  ", cust_id, " - ", cust_name, " Balance: ", balance)
+
+    reads(ch, customer) [KEYNUM:1]
+    display(tt, "  ", cust_id, " - ", cust_name, " Balance: ", balance)
 
     ; Close the files
     close(ch)

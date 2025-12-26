@@ -14,3 +14,4 @@ zig-out/
 Thumbs.db
 *.is1
 *.ism
+*.zbc

@@ -107,6 +107,28 @@ pub const CallFrame = struct {
     base_pointer: usize,
 };
 
+/// Simple bounded call stack (replacement for removed BoundedArray)
+pub const CallStack = struct {
+    buffer: [MAX_CALL_DEPTH]CallFrame = undefined,
+    len: usize = 0,
+
+    pub fn append(self: *CallStack, item: CallFrame) !void {
+        if (self.len >= MAX_CALL_DEPTH) return error.CallStackOverflow;
+        self.buffer[self.len] = item;
+        self.len += 1;
+    }
+
+    pub fn pop(self: *CallStack) ?CallFrame {
+        if (self.len == 0) return null;
+        self.len -= 1;
+        return self.buffer[self.len];
+    }
+
+    pub fn slice(self: *CallStack) []CallFrame {
+        return self.buffer[0..self.len];
+    }
+};
+
 /// Channel state
 pub const Channel = struct {
     file: ?std.fs.File,
@@ -130,7 +152,7 @@ pub const VM = struct {
     heap: std.heap.ArenaAllocator,
 
     // Call stack
-    call_stack: std.BoundedArray(CallFrame, MAX_CALL_DEPTH),
+    call_stack: CallStack,
 
     // I/O
     channels: [MAX_CHANNELS]Channel,
@@ -159,13 +181,13 @@ pub const VM = struct {
             .sp = 0,
             .fp = 0,
             .stack = undefined,
-            .globals = std.ArrayList(Value).init(allocator),
+            .globals = .{},
             .heap = std.heap.ArenaAllocator.init(allocator),
             .call_stack = .{},
             .channels = channels,
-            .stdout = std.io.getStdOut(),
+            .stdout = std.fs.File.stdout(),
             .current_module = null,
-            .modules = std.ArrayList(*const Module).init(allocator),
+            .modules = .{},
         };
     }
 
@@ -175,14 +197,14 @@ pub const VM = struct {
             if (ch.file) |*f| f.close();
         }
 
-        self.globals.deinit();
+        self.globals.deinit(self.allocator);
         self.heap.deinit();
-        self.modules.deinit();
+        self.modules.deinit(self.allocator);
     }
 
     /// Load a module
     pub fn loadModule(self: *Self, module: *const Module) !void {
-        try self.modules.append(module);
+        try self.modules.append(self.allocator, module);
     }
 
     /// Execute a module
@@ -292,7 +314,7 @@ pub const VM = struct {
                     const idx = self.readU16(module);
                     const val = try self.pop();
                     while (self.globals.items.len <= idx) {
-                        self.globals.append(.{ .null_val = {} }) catch
+                        self.globals.append(self.allocator, .{ .null_val = {} }) catch
                             return VMError.OutOfMemory;
                     }
                     self.globals.items[idx] = val;
@@ -433,7 +455,7 @@ pub const VM = struct {
                     if (self.call_stack.len == 0) {
                         return; // Return from main
                     }
-                    const frame = self.call_stack.pop();
+                    const frame = self.call_stack.pop().?;
                     self.ip = frame.return_ip;
                     self.sp = frame.base_pointer;
                     self.current_module = frame.module;
@@ -444,7 +466,7 @@ pub const VM = struct {
                     if (self.call_stack.len == 0) {
                         return;
                     }
-                    const frame = self.call_stack.pop();
+                    const frame = self.call_stack.pop().?;
                     self.ip = frame.return_ip;
                     self.sp = frame.base_pointer;
                     self.current_module = frame.module;
@@ -500,10 +522,11 @@ pub const VM = struct {
 
     fn pushConstant(self: *Self, constant: Constant) VMError!void {
         const value: Value = switch (constant) {
-            .integer => |i| .{ .integer = i },
-            .decimal => |d| .{ .decimal = .{ .value = d.value, .precision = d.precision } },
-            .string => |s| .{ .string = s },
-            .alpha => |a| .{ .alpha = @constCast(a.data) },
+            .integer => |ival| .{ .integer = ival },
+            .decimal => |dval| .{ .decimal = .{ .value = dval.value, .precision = dval.precision } },
+            .string => |sval| .{ .string = sval },
+            .alpha => |aval| .{ .alpha = @constCast(aval.data) },
+            .identifier => |idval| .{ .string = idval }, // Identifiers are strings
             else => .{ .null_val = {} },
         };
         try self.push(value);
@@ -567,20 +590,40 @@ pub const VM = struct {
         const channel = (try self.pop()).toInt();
 
         // Get writer
-        var writer = self.stdout.writer();
+        var write_buffer: [4096]u8 = undefined;
+        var buffered = self.stdout.writer(&write_buffer);
+        const writer = &buffered.interface;
 
-        // Write arguments
+        // Write arguments - format each value appropriately
         for (args[0..arg_count]) |arg| {
-            writer.print("{}", .{arg}) catch {};
+            switch (arg) {
+                .null_val => writer.writeAll("") catch {},
+                .boolean => |bval| if (bval) {
+                    writer.writeAll("1") catch {};
+                } else {
+                    writer.writeAll("0") catch {};
+                },
+                .integer => |ival| writer.print("{d}", .{ival}) catch {},
+                .decimal => |dval| {
+                    const divisor = std.math.pow(i64, 10, dval.precision);
+                    const whole = @divTrunc(dval.value, divisor);
+                    const frac = @abs(@rem(dval.value, divisor));
+                    writer.print("{d}.{d}", .{ whole, frac }) catch {};
+                },
+                .alpha => |aval| writer.print("{s}", .{aval}) catch {},
+                .string => |sval| writer.print("{s}", .{sval}) catch {},
+                .record_ref => writer.writeAll("<record>") catch {},
+                .handle => |hval| writer.print("<handle:{d}>", .{hval}) catch {},
+            }
         }
         writer.writeByte('\n') catch {};
+        writer.flush() catch {};
         _ = channel;
     }
 
     fn executeOpen(self: *Self, flags: u8) VMError!void {
-        _ = flags;
+        _ = flags; // Mode is encoded in flags, not on stack
         _ = try self.pop(); // filename
-        _ = try self.pop(); // mode
         const channel = (try self.pop()).toInt();
 
         if (channel >= 0 and channel < MAX_CHANNELS) {

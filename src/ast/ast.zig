@@ -80,6 +80,10 @@ pub const Statement = union(enum) {
             .group => |g| allocator.free(g.fields),
             .display_stmt => |d| allocator.free(d.expressions),
             .xcall => |x| allocator.free(x.arguments),
+            .read_stmt => |r| if (r.qualifiers.len > 0) allocator.free(r.qualifiers),
+            .write_stmt => |w| if (w.qualifiers.len > 0) allocator.free(w.qualifiers),
+            .open_stmt => |o| if (o.qualifiers.len > 0) allocator.free(o.qualifiers),
+            .store_stmt => |s| if (s.qualifiers.len > 0) allocator.free(s.qualifiers),
             else => {},
         }
     }

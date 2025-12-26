@@ -78,10 +78,10 @@ pub const Compiler = struct {
     pub fn init(allocator: Allocator) Self {
         return .{
             .allocator = allocator,
-            .code = std.ArrayList(u8).init(allocator),
-            .constants = std.ArrayList(module.Constant).init(allocator),
-            .types = std.ArrayList(module.TypeDef).init(allocator),
-            .routines = std.ArrayList(module.RoutineDef).init(allocator),
+            .code = .{},
+            .constants = .{},
+            .types = .{},
+            .routines = .{},
             .globals = std.StringHashMap(VarInfo).init(allocator),
             .global_count = 0,
             .locals = std.StringHashMap(VarInfo).init(allocator),
@@ -93,25 +93,25 @@ pub const Compiler = struct {
             .current_stack = 0,
             .emit_debug = true,
             .current_line = 0,
-            .line_table = std.ArrayList(module.LineEntry).init(allocator),
+            .line_table = .{},
         };
     }
 
     pub fn deinit(self: *Self) void {
-        self.code.deinit();
-        self.constants.deinit();
-        self.types.deinit();
-        self.routines.deinit();
+        self.code.deinit(self.allocator);
+        self.constants.deinit(self.allocator);
+        self.types.deinit(self.allocator);
+        self.routines.deinit(self.allocator);
         self.globals.deinit();
         self.locals.deinit();
         var label_iter = self.labels.valueIterator();
         while (label_iter.next()) |label| {
-            label.references.deinit();
+            label.references.deinit(self.allocator);
         }
         self.labels.deinit();
         self.string_constants.deinit();
         self.int_constants.deinit();
-        self.line_table.deinit();
+        self.line_table.deinit(self.allocator);
     }
 
     fn pushStack(self: *Self, count: u16) void {
@@ -183,8 +183,8 @@ pub const Compiler = struct {
         else
             try self.addStringConstant("__anon__");
 
-        var fields = std.ArrayList(module.FieldDef).init(self.allocator);
-        defer fields.deinit();
+        var fields: std.ArrayList(module.FieldDef) = .{};
+        defer fields.deinit(self.allocator);
 
         var offset: u16 = 0;
         for (record.fields) |field| {
@@ -192,7 +192,7 @@ pub const Compiler = struct {
             const data_type = dataTypeFromAst(field.data_type);
             const size = getSizeFromDataType(field.data_type);
 
-            try fields.append(.{
+            try fields.append(self.allocator, .{
                 .name_index = field_name_idx,
                 .data_type = data_type,
                 .flags = 0,
@@ -208,13 +208,13 @@ pub const Compiler = struct {
             offset += size;
         }
 
-        try self.types.append(.{
+        try self.types.append(self.allocator, .{
             .type_id = @intCast(self.types.items.len),
             .kind = .record,
             .flags = 0,
             .name_index = name_idx,
             .total_size = offset,
-            .fields = try fields.toOwnedSlice(),
+            .fields = try fields.toOwnedSlice(self.allocator),
         });
     }
 
@@ -328,8 +328,8 @@ pub const Compiler = struct {
         // Compile selector expression
         try self.compileExpression(&case_s.selector);
 
-        var case_end_jumps = std.ArrayList(usize).init(self.allocator);
-        defer case_end_jumps.deinit();
+        var case_end_jumps: std.ArrayList(usize) = .{};
+        defer case_end_jumps.deinit(self.allocator);
 
         for (case_s.cases) |case| {
             // For each case value
@@ -365,7 +365,7 @@ pub const Compiler = struct {
 
             // Jump to end
             try self.emit(.jump);
-            try case_end_jumps.append(self.code.items.len);
+            try case_end_jumps.append(self.allocator, self.code.items.len);
             try self.emitU16(0);
         }
 
@@ -765,29 +765,29 @@ pub const Compiler = struct {
     // ========================================
 
     fn emit(self: *Self, op: Opcode) CompileError!void {
-        try self.code.append(@intFromEnum(op));
+        try self.code.append(self.allocator, @intFromEnum(op));
     }
 
     fn emitU8(self: *Self, val: u8) CompileError!void {
-        try self.code.append(val);
+        try self.code.append(self.allocator, val);
     }
 
     fn emitU16(self: *Self, val: u16) CompileError!void {
-        try self.code.appendSlice(&std.mem.toBytes(val));
+        try self.code.appendSlice(self.allocator, &std.mem.toBytes(val));
     }
 
     fn emitU32(self: *Self, val: u32) CompileError!void {
-        try self.code.appendSlice(&std.mem.toBytes(val));
+        try self.code.appendSlice(self.allocator, &std.mem.toBytes(val));
     }
 
     fn emitU64(self: *Self, val: u64) CompileError!void {
-        try self.code.appendSlice(&std.mem.toBytes(val));
+        try self.code.appendSlice(self.allocator, &std.mem.toBytes(val));
     }
 
     fn emitJumpOffset(self: *Self, target: u32) CompileError!void {
         const current: i32 = @intCast(self.code.items.len + 2);
         const offset: i16 = @intCast(@as(i32, @intCast(target)) - current);
-        try self.code.appendSlice(&std.mem.toBytes(offset));
+        try self.code.appendSlice(self.allocator, &std.mem.toBytes(offset));
     }
 
     fn emitJumpBack(self: *Self, target: u32) CompileError!void {
@@ -894,7 +894,9 @@ pub const Compiler = struct {
         }
         if (self.constants.items.len >= 65535) return CompileError.TooManyConstants;
         const idx: u16 = @intCast(self.constants.items.len);
-        try self.constants.append(.{ .identifier = str });
+        // Dupe the string so it can be freed when module is deinitialized
+        const duped = self.allocator.dupe(u8, str) catch return CompileError.OutOfMemory;
+        try self.constants.append(self.allocator, .{ .identifier = duped });
         try self.string_constants.put(str, idx);
         return idx;
     }
@@ -902,7 +904,7 @@ pub const Compiler = struct {
     fn addDecimalConstant(self: *Self, value: i64, precision: u8) CompileError!u16 {
         if (self.constants.items.len >= 65535) return CompileError.TooManyConstants;
         const idx: u16 = @intCast(self.constants.items.len);
-        try self.constants.append(.{ .decimal = .{ .value = value, .precision = precision } });
+        try self.constants.append(self.allocator, .{ .decimal = .{ .value = value, .precision = precision } });
         return idx;
     }
 
@@ -915,17 +917,17 @@ pub const Compiler = struct {
             try self.labels.put(name, .{
                 .name = name,
                 .offset = offset,
-                .references = std.ArrayList(u32).init(self.allocator),
+                .references = .{},
             });
         }
     }
 
     fn addLabelReference(self: *Self, name: []const u8, ref_loc: u32) CompileError!void {
         if (self.labels.getPtr(name)) |label| {
-            try label.references.append(ref_loc);
+            try label.references.append(self.allocator, ref_loc);
         } else {
-            var refs = std.ArrayList(u32).init(self.allocator);
-            try refs.append(ref_loc);
+            var refs: std.ArrayList(u32) = .{};
+            try refs.append(self.allocator, ref_loc);
             try self.labels.put(name, .{
                 .name = name,
                 .offset = null,
@@ -955,13 +957,13 @@ pub const Compiler = struct {
         mod.header.section_count = 4; // constants, types, routines, code
         mod.header.entry_point = 0; // Main is at offset 0
 
-        mod.constants = try self.constants.toOwnedSlice();
-        mod.types = try self.types.toOwnedSlice();
-        mod.routines = try self.routines.toOwnedSlice();
-        mod.code = try self.code.toOwnedSlice();
+        mod.constants = try self.constants.toOwnedSlice(self.allocator);
+        mod.types = try self.types.toOwnedSlice(self.allocator);
+        mod.routines = try self.routines.toOwnedSlice(self.allocator);
+        mod.code = try self.code.toOwnedSlice(self.allocator);
 
         if (self.emit_debug) {
-            mod.line_table = try self.line_table.toOwnedSlice();
+            mod.line_table = try self.line_table.toOwnedSlice(self.allocator);
         }
 
         return mod;

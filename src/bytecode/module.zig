@@ -370,7 +370,21 @@ pub const Module = struct {
             return error.InvalidModule;
         }
 
-        // TODO: Read sections
+        // Read constants section
+        const const_count = try reader.readInt(u32, .little);
+        if (const_count > 0) {
+            module.constants = try allocator.alloc(Constant, const_count);
+            for (0..const_count) |i| {
+                module.constants[i] = try Constant.deserialize(allocator, reader);
+            }
+        }
+
+        // Read code section
+        const code_len = try reader.readInt(u32, .little);
+        if (code_len > 0) {
+            module.code = try allocator.alloc(u8, code_len);
+            try reader.readNoEof(module.code);
+        }
 
         return module;
     }
