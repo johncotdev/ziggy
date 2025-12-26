@@ -389,8 +389,8 @@ pub const Compiler = struct {
         const loop_start: u32 = @intCast(self.code.items.len);
 
         // Init expression for for-loops
-        if (loop.init_expr) |init| {
-            try self.compileExpression(&init);
+        if (loop.init_expr) |init_expr| {
+            try self.compileExpression(&init_expr);
             try self.emit(.pop);
             self.popStack(1);
         }

@@ -92,6 +92,70 @@ pub const Constant = union(ConstantTag) {
     identifier: []const u8,
     record_ref: u16,
     routine_ref: u16,
+
+    /// Serialize constant to writer
+    pub fn serialize(self: Constant, writer: anytype) !void {
+        // Write tag
+        try writer.writeByte(@intFromEnum(std.meta.activeTag(self)));
+
+        switch (self) {
+            .integer => |val| try writer.writeInt(i64, val, .little),
+            .decimal => |d| {
+                try writer.writeInt(i64, d.value, .little);
+                try writer.writeByte(d.precision);
+            },
+            .string => |s| {
+                try writer.writeInt(u32, @intCast(s.len), .little);
+                try writer.writeAll(s);
+            },
+            .alpha => |a| {
+                try writer.writeInt(u16, a.size, .little);
+                try writer.writeAll(a.data[0..a.size]);
+            },
+            .identifier => |id| {
+                try writer.writeInt(u32, @intCast(id.len), .little);
+                try writer.writeAll(id);
+            },
+            .record_ref => |r| try writer.writeInt(u16, r, .little),
+            .routine_ref => |r| try writer.writeInt(u16, r, .little),
+        }
+    }
+
+    /// Deserialize constant from reader
+    pub fn deserialize(allocator: std.mem.Allocator, reader: anytype) !Constant {
+        const tag = try reader.readByte();
+        const tag_enum: ConstantTag = @enumFromInt(tag);
+
+        return switch (tag_enum) {
+            .integer => .{ .integer = try reader.readInt(i64, .little) },
+            .decimal => .{
+                .decimal = .{
+                    .value = try reader.readInt(i64, .little),
+                    .precision = try reader.readByte(),
+                },
+            },
+            .string => blk: {
+                const len = try reader.readInt(u32, .little);
+                const str = try allocator.alloc(u8, len);
+                try reader.readNoEof(str);
+                break :blk .{ .string = str };
+            },
+            .alpha => blk: {
+                const size = try reader.readInt(u16, .little);
+                const data = try allocator.alloc(u8, size);
+                try reader.readNoEof(data);
+                break :blk .{ .alpha = .{ .data = data, .size = size } };
+            },
+            .identifier => blk: {
+                const len = try reader.readInt(u32, .little);
+                const id = try allocator.alloc(u8, len);
+                try reader.readNoEof(id);
+                break :blk .{ .identifier = id };
+            },
+            .record_ref => .{ .record_ref = try reader.readInt(u16, .little) },
+            .routine_ref => .{ .routine_ref = try reader.readInt(u16, .little) },
+        };
+    }
 };
 
 /// Data type codes
@@ -283,8 +347,15 @@ pub const Module = struct {
         // Write header
         try writer.writeAll(std.mem.asBytes(&self.header));
 
-        // TODO: Write sections
-        _ = self;
+        // Write constants section
+        try writer.writeInt(u32, @intCast(self.constants.len), .little);
+        for (self.constants) |constant| {
+            try constant.serialize(writer);
+        }
+
+        // Write code section
+        try writer.writeInt(u32, @intCast(self.code.len), .little);
+        try writer.writeAll(self.code);
     }
 
     /// Deserialize module from bytes

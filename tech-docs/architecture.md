@@ -51,12 +51,14 @@
                     │             └─────────────────────────────────┘
                     │                             │
                     └──────────────┬──────────────┘
-                                   ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                         ISAM Database                                │
-│                        src/isam/isam.zig                            │
-│              B+ tree indexed file storage                            │
-└─────────────────────────────────────────────────────────────────────┘
+                                   │
+        ┌──────────────────────────┼──────────────────────────┐
+        ▼                          ▼                          ▼
+┌─────────────────┐   ┌─────────────────────────┐   ┌─────────────────┐
+│  Subroutines    │   │     ISAM Database       │   │    Stdlib       │
+│  src/subroutines│   │    src/isam/isam.zig    │   │ src/subroutines │
+│  XCALL dispatch │   │  B+ tree indexed files  │   │ /stdlib.zig     │
+└─────────────────┘   └─────────────────────────┘   └─────────────────┘
 ```
 
 ## Module Details
@@ -188,6 +190,38 @@ See [bytecode.md](./bytecode.md) for detailed documentation.
 ```
 
 See [isam.md](./isam.md) for detailed documentation.
+
+### Subroutines Module (`src/subroutines/`)
+
+**Purpose**: Unified XCALL dispatch for native and DBL subroutines.
+
+**Key Files**:
+- `subroutines.zig` - Central registry
+- `channels.zig` - I/O channel management
+- `linker.zig` - Bytecode module loader
+- `stdlib.zig` - Standard library functions
+
+**Architecture**:
+```
+┌────────────────────────────────────────────────────┐
+│              SubroutineRegistry                     │
+├────────────────────────────────────────────────────┤
+│  Native Subroutines    │   DBL Subroutines         │
+│  (Zig functions)       │   (from .zbc modules)     │
+├────────────────────────┼───────────────────────────┤
+│  isamc, flags, fill    │   loaded via Linker       │
+│  date, time, upcase    │   exports registered      │
+└────────────────────────┴───────────────────────────┘
+                    │
+         ┌──────────┴──────────┐
+         ▼                     ▼
+┌─────────────────┐   ┌─────────────────┐
+│ ChannelManager  │   │     Linker      │
+│ I/O channels    │   │ .zbc loader     │
+└─────────────────┘   └─────────────────┘
+```
+
+See [subroutines.md](./subroutines.md) for detailed documentation.
 
 ## Data Flow Examples
 

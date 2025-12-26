@@ -20,6 +20,7 @@ Ziggy DBL is a Zig implementation of Synergy DBL (Dibol Business Language), a le
 | [isam.md](./isam.md) | ISAM database implementation details |
 | [ast.md](./ast.md) | Abstract Syntax Tree structure |
 | [runtime.md](./runtime.md) | Runtime interpreter documentation |
+| [subroutines.md](./subroutines.md) | Subroutine registry and stdlib |
 
 ## Quick Reference
 
@@ -29,6 +30,7 @@ Ziggy DBL is a Zig implementation of Synergy DBL (Dibol Business Language), a le
 ziggy/
 ├── src/
 │   ├── main.zig           # CLI entry point
+│   ├── root.zig           # Library exports
 │   ├── lexer/             # Tokenizer
 │   ├── parser/            # Recursive descent parser
 │   ├── ast/               # AST definitions
@@ -39,9 +41,16 @@ ziggy/
 │   │   ├── opcodes.zig    # Instruction set
 │   │   ├── module.zig     # Binary format
 │   │   └── disasm.zig     # Disassembler
-│   └── isam/              # ISAM database
-│       ├── isam.zig       # File operations
-│       └── btree.zig      # B+ tree index
+│   ├── subroutines/       # Subroutine registry
+│   │   ├── subroutines.zig # Central registry
+│   │   ├── channels.zig   # I/O channel manager
+│   │   ├── linker.zig     # Module loader
+│   │   └── stdlib.zig     # Standard library
+│   ├── isam/              # ISAM database
+│   │   ├── isam.zig       # File operations
+│   │   └── btree.zig      # B+ tree index
+│   └── builtins/          # Built-in functions
+├── stdlib/                # DBL standard library (future)
 ├── docs/                  # User documentation
 ├── tech-docs/             # Technical docs (this directory)
 └── examples/              # Example DBL programs
@@ -84,4 +93,6 @@ When working on this codebase:
 
 - **Adding a new opcode**: Edit `opcodes.zig`, add to `operandSize()`, implement in `vm.zig`
 - **Adding a statement**: Update `ast.zig`, `parser.zig`, `compiler.zig`, `runtime.zig`
+- **Adding a native subroutine**: Add function in `subroutines.zig`, register in `registerNativeSubroutines()`
+- **Adding stdlib function**: Add in `stdlib.zig`, register in `registerStdlibNatives()`
 - **ISAM changes**: Test with `examples/isam_demo.dbl` to verify behavior

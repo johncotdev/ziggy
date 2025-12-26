@@ -5,6 +5,7 @@
 const std = @import("std");
 const ast = @import("../ast/ast.zig");
 const isam = @import("../isam/isam.zig");
+const subroutines = @import("../subroutines/subroutines.zig");
 
 pub const RuntimeError = error{
     UndefinedVariable,
@@ -114,6 +115,7 @@ pub const Runtime = struct {
     channels: [1024]Channel,
     call_stack: std.ArrayListAligned(CallFrame, null),
     output_buffer: std.ArrayListAligned(u8, null),
+    subroutine_registry: subroutines.SubroutineRegistry,
 
     const Self = @This();
 
@@ -143,7 +145,19 @@ pub const Runtime = struct {
             .channels = channels,
             .call_stack = .empty,
             .output_buffer = .empty,
+            .subroutine_registry = subroutines.SubroutineRegistry.init(allocator),
         };
+    }
+
+    /// Put a variable, freeing any old alpha buffer
+    fn putVariable(self: *Self, name: []const u8, value: Value) !void {
+        // Free old alpha buffer if present
+        if (self.variables.get(name)) |old| {
+            if (old == .alpha) {
+                self.allocator.free(old.alpha);
+            }
+        }
+        try self.variables.put(name, value);
     }
 
     /// Clean up runtime
@@ -179,6 +193,9 @@ pub const Runtime = struct {
         }
         self.call_stack.deinit(self.allocator);
         self.output_buffer.deinit(self.allocator);
+
+        // Free subroutine registry
+        self.subroutine_registry.deinit();
     }
 
     /// Write to stdout
@@ -234,7 +251,7 @@ pub const Runtime = struct {
         // Initialize fields to default values
         for (record.fields) |field| {
             const value = try self.createDefaultValue(field.data_type);
-            try self.variables.put(field.name, value);
+            self.putVariable(field.name, value) catch return RuntimeError.OutOfMemory;
         }
 
         // Store record definition if it has a name
@@ -248,7 +265,7 @@ pub const Runtime = struct {
 
         switch (assignment.target) {
             .identifier => |name| {
-                try self.variables.put(name, value);
+                self.putVariable(name, value) catch return RuntimeError.OutOfMemory;
             },
             else => {
                 // TODO: Handle member access, array indexing, etc.
@@ -330,7 +347,7 @@ pub const Runtime = struct {
             .identifier => |name| {
                 if (self.variables.get(name)) |current| {
                     const new_val = current.toInteger() + amount;
-                    try self.variables.put(name, Value{ .integer = new_val });
+                    self.putVariable(name, Value{ .integer = new_val }) catch return RuntimeError.OutOfMemory;
                 }
             },
             else => {},
@@ -338,16 +355,58 @@ pub const Runtime = struct {
     }
 
     fn executeXCall(self: *Self, xcall: ast.XCallStatement) RuntimeError!void {
-        // Dispatch to built-in subroutines
+        // Normalize routine name to lowercase
         const routine_buf = self.allocator.alloc(u8, xcall.routine_name.len) catch return RuntimeError.OutOfMemory;
         defer self.allocator.free(routine_buf);
         const routine_name = std.ascii.lowerString(routine_buf, xcall.routine_name);
 
+        // Try the subroutine registry first
+        if (self.subroutine_registry.lookup(routine_name)) |sub_def| {
+            // Convert args to Values for the subroutine context
+            var args = std.ArrayListAligned(Value, null).empty;
+            defer {
+                for (args.items) |arg| {
+                    if (arg == .alpha) {
+                        self.allocator.free(arg.alpha);
+                    }
+                }
+                args.deinit(self.allocator);
+            }
+
+            for (xcall.arguments) |arg_expr| {
+                const val = try self.evaluateExpression(arg_expr);
+                args.append(self.allocator, val) catch return RuntimeError.OutOfMemory;
+            }
+
+            // Create dummy channel manager for now (registry needs channels)
+            var channel_mgr = subroutines.ChannelManager.init(self.allocator);
+            defer channel_mgr.deinit();
+
+            var ctx = subroutines.SubroutineContext{
+                .allocator = self.allocator,
+                .args = args.items,
+                .channels = &channel_mgr,
+            };
+
+            // Call via registry
+            _ = self.subroutine_registry.call(routine_name, &ctx) catch |err| {
+                switch (err) {
+                    subroutines.SubroutineError.NotImplemented => {
+                        // Fall through to legacy implementations
+                    },
+                    else => return RuntimeError.InvalidOperation,
+                }
+            };
+
+            // If we get here and it was found, we're done
+            if (sub_def.native_fn != null) return;
+        }
+
+        // Fallback to legacy inline implementations
         if (std.mem.eql(u8, routine_name, "isamc")) {
             try self.executeIsamc(xcall.arguments);
-        } else {
-            // Unknown routine - for now just ignore
         }
+        // Unknown routines are silently ignored for now
     }
 
     /// ISAMC - Create an ISAM file
@@ -508,7 +567,7 @@ pub const Runtime = struct {
                     // Update the variable with assigned channel
                     switch (open.channel) {
                         .identifier => |name| {
-                            try self.variables.put(name, Value{ .integer = channel_num });
+                            self.putVariable(name, Value{ .integer = channel_num }) catch return RuntimeError.OutOfMemory;
                         },
                         else => {},
                     }
@@ -631,6 +690,12 @@ pub const Runtime = struct {
 
         // Get record data from expression
         const record_value = try self.evaluateExpression(store.record);
+        defer {
+            // Free the alpha buffer if it was allocated by buildRecordBuffer
+            if (record_value == .alpha) {
+                self.allocator.free(record_value.alpha);
+            }
+        }
         const record_data = try record_value.toString(self.allocator);
         defer self.allocator.free(record_data);
 

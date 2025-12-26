@@ -7,6 +7,8 @@
 //! - Runtime: Interpreter and execution environment
 //! - ISAM: Indexed Sequential Access Method database
 //! - Builtins: Built-in functions and subroutines
+//! - Bytecode: Bytecode compiler and VM
+//! - Subroutines: XCALL subroutine registry
 
 const std = @import("std");
 
@@ -18,6 +20,12 @@ pub const ast = @import("ast/ast.zig");
 // Runtime modules
 pub const runtime = @import("runtime/runtime.zig");
 pub const builtins = @import("builtins/builtins.zig");
+
+// Bytecode compiler and VM
+pub const bytecode = @import("bytecode/bytecode.zig");
+
+// Subroutine registry
+pub const subroutines = @import("subroutines/subroutines.zig");
 
 // ISAM database
 pub const isam = @import("isam/isam.zig");
