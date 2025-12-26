@@ -1,0 +1,43 @@
+; isam_demo.dbl - ISAM file operations demo
+;
+; Demonstrates basic ISAM file operations
+
+record customer
+    cust_id         ,d8
+    cust_name       ,a50
+    balance         ,d12.2
+    status          ,a1
+endrecord
+
+record
+    channel         ,i4
+    search_id       ,d8
+endrecord
+
+proc
+    channel = 1
+
+    ; Open ISAM file
+    open(channel, U:I, "customer.ism")
+
+    ; Store a new record
+    clear customer
+    cust_id = 10001
+    cust_name = "Acme Corporation"
+    balance = 1500.00
+    status = "A"
+    store(channel, customer)
+
+    ; Read record by key
+    search_id = 10001
+    read(channel, customer, search_id)
+    display(1, "Found: ", cust_name, " Balance: ", balance)
+
+    ; Update record
+    balance = balance + 500.00
+    write(channel, customer)
+
+    ; Close file
+    close(channel)
+
+end

@@ -1,0 +1,23 @@
+; hello.dbl - A simple Ziggy DBL example
+;
+; This is a basic "Hello, World" program in DBL
+
+record
+    name        ,a30
+    age         ,d3
+    message     ,a50
+endrecord
+
+proc
+    name = "World"
+    age = 42
+
+    display(1, "Hello, ", name, "!")
+    display(1, "You are ", age, " years old.")
+
+    if (age .GE. 18) then
+        display(1, "You are an adult.")
+    else
+        display(1, "You are a minor.")
+
+end
