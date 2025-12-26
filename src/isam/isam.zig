@@ -166,8 +166,11 @@ pub const IsamFile = struct {
     index_header: IndexHeader,
     data_header: DataHeader,
     key_defs: []KeyDef,
+    btrees: []btree.BTree, // One B-tree per key definition
     current_key: u8,
     current_rfa: ?RFA,
+    current_node: ?*btree.Node, // Current position in B-tree for sequential access
+    current_position: usize, // Position within current node
     is_locked: bool,
     buffer_pool: BufferPool,
 
@@ -196,16 +199,33 @@ pub const IsamFile = struct {
         const data_name = std.fmt.bufPrint(&data_name_buf, "{s}.is1", .{filename}) catch
             return IsamError.OutOfMemory;
 
-        // Create files
-        const index_file = std.fs.cwd().createFile(index_name, .{}) catch
+        // Create files with read+write access
+        const index_file = std.fs.cwd().createFile(index_name, .{ .read = true }) catch
             return IsamError.IoError;
         errdefer index_file.close();
 
-        const data_file = std.fs.cwd().createFile(data_name, .{}) catch
+        const data_file = std.fs.cwd().createFile(data_name, .{ .read = true }) catch
             return IsamError.IoError;
         errdefer data_file.close();
 
         // Initialize headers
+        // Initialize B-trees for each key
+        const btrees = allocator.alloc(btree.BTree, key_defs.len) catch return IsamError.OutOfMemory;
+        for (btrees) |*bt| {
+            bt.* = btree.BTree.init(allocator);
+        }
+
+        // Deep copy key definitions (including segments)
+        const owned_key_defs = allocator.alloc(KeyDef, key_defs.len) catch return IsamError.OutOfMemory;
+        for (key_defs, 0..) |kd, i| {
+            owned_key_defs[i] = .{
+                .segments = allocator.dupe(KeyDef.KeySegment, kd.segments) catch return IsamError.OutOfMemory,
+                .allow_duplicates = kd.allow_duplicates,
+                .changes_allowed = kd.changes_allowed,
+                .key_number = kd.key_number,
+            };
+        }
+
         self.* = .{
             .allocator = allocator,
             .index_file = index_file,
@@ -227,9 +247,12 @@ pub const IsamFile = struct {
                 .free_list_head = 0,
                 .record_count = 0,
             },
-            .key_defs = allocator.dupe(KeyDef, key_defs) catch return IsamError.OutOfMemory,
+            .key_defs = owned_key_defs,
+            .btrees = btrees,
             .current_key = 0,
             .current_rfa = null,
+            .current_node = null,
+            .current_position = 0,
             .is_locked = false,
             .buffer_pool = BufferPool.init(allocator),
         };
@@ -288,18 +311,33 @@ pub const IsamFile = struct {
             return IsamError.InvalidFormat;
         }
 
+        // Create B-trees based on key_count from header
+        const btrees = allocator.alloc(btree.BTree, index_header.key_count) catch return IsamError.OutOfMemory;
+        for (btrees) |*bt| {
+            bt.* = btree.BTree.init(allocator);
+        }
+
         self.* = .{
             .allocator = allocator,
             .index_file = index_file,
             .data_file = data_file,
             .index_header = index_header,
             .data_header = data_header,
-            .key_defs = &[_]KeyDef{}, // TODO: Read from file
+            .key_defs = &[_]KeyDef{},
+            .btrees = btrees,
             .current_key = 0,
             .current_rfa = null,
+            .current_node = null,
+            .current_position = 0,
             .is_locked = false,
             .buffer_pool = BufferPool.init(allocator),
         };
+
+        // Read key definitions from file
+        try self.readKeyDefs();
+
+        // Load B-tree from index file
+        try self.deserializeIndex();
 
         return self;
     }
@@ -312,8 +350,18 @@ pub const IsamFile = struct {
 
     /// Close the ISAM file
     pub fn close(self: *Self) void {
+        // Persist index to disk before closing
+        self.serializeIndex() catch {};
+        self.writeHeaders() catch {};
+
         self.buffer_pool.flush() catch {};
         self.buffer_pool.deinit();
+
+        // Clean up B-trees
+        for (self.btrees) |*bt| {
+            bt.deinit();
+        }
+        self.allocator.free(self.btrees);
 
         if (self.index_file) |*f| {
             f.close();
@@ -324,7 +372,15 @@ pub const IsamFile = struct {
             self.data_file = null;
         }
 
-        self.allocator.free(self.key_defs);
+        if (self.key_defs.len > 0) {
+            // Free segments for each key definition
+            for (self.key_defs) |kd| {
+                if (kd.segments.len > 0) {
+                    self.allocator.free(kd.segments);
+                }
+            }
+            self.allocator.free(self.key_defs);
+        }
         self.allocator.destroy(self);
     }
 
@@ -384,12 +440,9 @@ pub const IsamFile = struct {
 
     /// Read next sequential record
     pub fn readNext(self: *Self, record_buf: []u8) IsamError!usize {
-        if (self.current_rfa == null) {
-            return IsamError.EndOfFile;
-        }
-
         // Get next RFA from current position in index
-        const next_rfa = try self.getNextRfa(self.current_key, self.current_rfa.?);
+        // If no current position, getNextRfa starts from beginning
+        const next_rfa = try self.getNextRfa(self.current_key, self.current_rfa);
 
         const len = try self.readRecord(next_rfa, record_buf);
         self.current_rfa = next_rfa;
@@ -435,6 +488,102 @@ pub const IsamFile = struct {
     pub fn flush(self: *Self) IsamError!void {
         try self.buffer_pool.flush();
         try self.writeHeaders();
+        try self.serializeIndex();
+    }
+
+    /// Serialize B-tree indexes to disk
+    fn serializeIndex(self: *Self) IsamError!void {
+        const index_file = self.index_file orelse return IsamError.IoError;
+
+        // Seek past header (reserve space for header + key defs)
+        const header_size: u64 = DEFAULT_BLOCK_SIZE;
+        index_file.seekTo(header_size) catch return IsamError.IoError;
+
+        // For each B-tree, serialize all leaf entries
+        for (self.btrees, 0..) |*bt, key_idx| {
+            // Get first leaf and count entries
+            var entry_count: u32 = @intCast(bt.size);
+
+            // Write entry count for this key
+            _ = index_file.write(std.mem.asBytes(&entry_count)) catch return IsamError.IoError;
+
+            // Traverse leaves and write entries
+            var leaf = bt.firstLeaf();
+            while (leaf) |node| {
+                var i: usize = 0;
+                while (i < node.key_count) : (i += 1) {
+                    const key = node.keys[i];
+                    const rec = node.records[i];
+
+                    // Write key length
+                    const key_len: u16 = @intCast(key.data.len);
+                    _ = index_file.write(std.mem.asBytes(&key_len)) catch return IsamError.IoError;
+
+                    // Write key data
+                    _ = index_file.write(key.data) catch return IsamError.IoError;
+
+                    // Write RFA
+                    const rfa_bytes = (RFA{ .block = rec.block, .offset = rec.offset }).toBytes();
+                    _ = index_file.write(&rfa_bytes) catch return IsamError.IoError;
+                }
+                leaf = node.next_leaf;
+            }
+
+            _ = key_idx;
+        }
+    }
+
+    /// Deserialize B-tree indexes from disk
+    fn deserializeIndex(self: *Self) IsamError!void {
+        const index_file = self.index_file orelse return IsamError.IoError;
+
+        // Seek past header
+        const header_size: u64 = DEFAULT_BLOCK_SIZE;
+        index_file.seekTo(header_size) catch return IsamError.IoError;
+
+        // For each B-tree, read and insert entries
+        for (self.btrees) |*bt| {
+            // Read entry count
+            var count_buf: [4]u8 = undefined;
+            const count_read = index_file.read(&count_buf) catch return IsamError.IoError;
+            if (count_read < 4) {
+                // No more data, this is OK for newly created files
+                break;
+            }
+            const entry_count = std.mem.readInt(u32, &count_buf, .little);
+
+            // Read each entry
+            var i: u32 = 0;
+            while (i < entry_count) : (i += 1) {
+                // Read key length
+                var len_buf: [2]u8 = undefined;
+                _ = index_file.read(&len_buf) catch return IsamError.IoError;
+                const key_len = std.mem.readInt(u16, &len_buf, .little);
+
+                // Read key data
+                const key_data = self.allocator.alloc(u8, key_len) catch return IsamError.OutOfMemory;
+                _ = index_file.read(key_data) catch {
+                    self.allocator.free(key_data);
+                    return IsamError.IoError;
+                };
+
+                // Read RFA
+                var rfa_buf: [8]u8 = undefined;
+                _ = index_file.read(&rfa_buf) catch {
+                    self.allocator.free(key_data);
+                    return IsamError.IoError;
+                };
+                const rfa = RFA.fromBytes(rfa_buf);
+
+                // Insert into B-tree
+                const btree_key = btree.Key{ .data = key_data };
+                const record_ptr = btree.RecordPtr{ .block = rfa.block, .offset = rfa.offset };
+                bt.insert(btree_key, record_ptr) catch {
+                    self.allocator.free(key_data);
+                    return IsamError.OutOfMemory;
+                };
+            }
+        }
     }
 
     // ============================================================
@@ -445,10 +594,83 @@ pub const IsamFile = struct {
         if (self.index_file) |f| {
             f.seekTo(0) catch return IsamError.IoError;
             _ = f.write(std.mem.asBytes(&self.index_header)) catch return IsamError.IoError;
+
+            // Write key definitions after header
+            for (self.key_defs) |key_def| {
+                // Write number of segments
+                const seg_count: u8 = @intCast(key_def.segments.len);
+                _ = f.write(&[_]u8{seg_count}) catch return IsamError.IoError;
+
+                // Write flags
+                const flags: u8 = (@as(u8, if (key_def.allow_duplicates) 1 else 0)) |
+                    (@as(u8, if (key_def.changes_allowed) 2 else 0));
+                _ = f.write(&[_]u8{flags}) catch return IsamError.IoError;
+
+                // Write key number
+                _ = f.write(&[_]u8{key_def.key_number}) catch return IsamError.IoError;
+
+                // Write each segment
+                for (key_def.segments) |seg| {
+                    _ = f.write(std.mem.asBytes(&seg.start)) catch return IsamError.IoError;
+                    _ = f.write(std.mem.asBytes(&seg.length)) catch return IsamError.IoError;
+                    _ = f.write(&[_]u8{@intFromEnum(seg.key_type)}) catch return IsamError.IoError;
+                }
+            }
         }
         if (self.data_file) |f| {
             f.seekTo(0) catch return IsamError.IoError;
             _ = f.write(std.mem.asBytes(&self.data_header)) catch return IsamError.IoError;
+        }
+    }
+
+    fn readKeyDefs(self: *Self) IsamError!void {
+        const f = self.index_file orelse return IsamError.IoError;
+
+        // Seek past main header
+        f.seekTo(@sizeOf(IndexHeader)) catch return IsamError.IoError;
+
+        // Read key definitions
+        const key_count = self.index_header.key_count;
+        self.key_defs = self.allocator.alloc(KeyDef, key_count) catch return IsamError.OutOfMemory;
+
+        for (self.key_defs, 0..) |*key_def, i| {
+            // Read segment count
+            var seg_count_buf: [1]u8 = undefined;
+            _ = f.read(&seg_count_buf) catch return IsamError.IoError;
+            const seg_count = seg_count_buf[0];
+
+            // Read flags
+            var flags_buf: [1]u8 = undefined;
+            _ = f.read(&flags_buf) catch return IsamError.IoError;
+            const flags = flags_buf[0];
+
+            // Read key number
+            var key_num_buf: [1]u8 = undefined;
+            _ = f.read(&key_num_buf) catch return IsamError.IoError;
+
+            // Allocate and read segments
+            const segments = self.allocator.alloc(KeyDef.KeySegment, seg_count) catch return IsamError.OutOfMemory;
+
+            for (segments) |*seg| {
+                var start_buf: [4]u8 = undefined;
+                _ = f.read(&start_buf) catch return IsamError.IoError;
+                seg.start = std.mem.readInt(u32, &start_buf, .little);
+
+                var len_buf: [4]u8 = undefined;
+                _ = f.read(&len_buf) catch return IsamError.IoError;
+                seg.length = std.mem.readInt(u32, &len_buf, .little);
+
+                var type_buf: [1]u8 = undefined;
+                _ = f.read(&type_buf) catch return IsamError.IoError;
+                seg.key_type = @enumFromInt(type_buf[0]);
+            }
+
+            key_def.* = .{
+                .segments = segments,
+                .allow_duplicates = (flags & 1) != 0,
+                .changes_allowed = (flags & 2) != 0,
+                .key_number = @intCast(i),
+            };
         }
     }
 
@@ -504,28 +726,98 @@ pub const IsamFile = struct {
     }
 
     fn insertKey(self: *Self, key_num: u8, key: []const u8, rfa: RFA) IsamError!void {
-        _ = self;
-        _ = key_num;
-        _ = key;
-        _ = rfa;
-        // TODO: B-tree insertion
+        if (key_num >= self.btrees.len) {
+            return IsamError.InvalidKey;
+        }
+
+        const bt = &self.btrees[key_num];
+        const btree_key = btree.Key{ .data = key };
+        const record_ptr = btree.RecordPtr{ .block = rfa.block, .offset = rfa.offset };
+
+        bt.insert(btree_key, record_ptr) catch return IsamError.OutOfMemory;
     }
 
     fn findKey(self: *Self, key_num: u8, key: []const u8, match_mode: MatchMode) IsamError!RFA {
-        _ = self;
-        _ = key_num;
-        _ = key;
-        _ = match_mode;
-        // TODO: B-tree search
-        return IsamError.KeyNotFound;
+        if (key_num >= self.btrees.len) {
+            return IsamError.InvalidKey;
+        }
+
+        const bt = &self.btrees[key_num];
+        const btree_key = btree.Key{ .data = key };
+
+        // Convert MatchMode to btree.BTree.SearchMode
+        const search_mode: btree.BTree.SearchMode = switch (match_mode) {
+            .exact => .exact,
+            .greater_equal => .greater_equal,
+            .greater => .greater,
+            .partial => .partial,
+        };
+
+        const result = bt.searchWithMode(btree_key, search_mode) orelse {
+            return IsamError.KeyNotFound;
+        };
+
+        // Store current position for sequential access
+        self.current_node = result.node;
+        self.current_position = result.position;
+
+        return RFA{
+            .block = result.node.records[result.position].block,
+            .offset = result.node.records[result.position].offset,
+        };
     }
 
-    fn getNextRfa(self: *Self, key_num: u8, current: RFA) IsamError!RFA {
-        _ = self;
-        _ = key_num;
-        _ = current;
-        // TODO: B-tree traversal
-        return IsamError.EndOfFile;
+    fn getNextRfa(self: *Self, key_num: u8, current: ?RFA) IsamError!RFA {
+        _ = current; // Position tracked via current_node/current_position
+
+        if (key_num >= self.btrees.len) {
+            return IsamError.InvalidKey;
+        }
+
+        // If no current position, start from beginning
+        if (self.current_node == null) {
+            const bt = &self.btrees[key_num];
+            const first = bt.firstLeaf() orelse return IsamError.EndOfFile;
+            self.current_node = first;
+            self.current_position = 0;
+
+            if (first.key_count == 0) {
+                return IsamError.EndOfFile;
+            }
+
+            return RFA{
+                .block = first.records[0].block,
+                .offset = first.records[0].offset,
+            };
+        }
+
+        var node = self.current_node.?;
+
+        // Move to next position
+        self.current_position += 1;
+
+        // Check if we need to move to next leaf
+        if (self.current_position >= node.key_count) {
+            if (node.next_leaf) |next| {
+                self.current_node = next;
+                self.current_position = 0;
+                node = next;
+
+                if (node.key_count == 0) {
+                    return IsamError.EndOfFile;
+                }
+            } else {
+                // No more leaves
+                self.current_node = null;
+                self.current_position = 0;
+                return IsamError.EndOfFile;
+            }
+        }
+
+        return RFA{
+            .block = node.records[self.current_position].block,
+            .offset = node.records[self.current_position].offset,
+        };
     }
 };
 
@@ -580,4 +872,142 @@ test "rfa conversion" {
 
     try std.testing.expectEqual(rfa.block, restored.block);
     try std.testing.expectEqual(rfa.offset, restored.offset);
+}
+
+test "isam store and read" {
+    const allocator = std.testing.allocator;
+
+    // Define a simple key on first 8 bytes
+    const key_segments = [_]KeyDef.KeySegment{
+        .{ .start = 0, .length = 8, .key_type = .alpha },
+    };
+    const key_defs = [_]KeyDef{
+        .{
+            .segments = &key_segments,
+            .allow_duplicates = false,
+            .changes_allowed = false,
+            .key_number = 0,
+        },
+    };
+
+    // Create ISAM file
+    const isam_file = try IsamFile.create(
+        allocator,
+        "/tmp/test_isam",
+        &key_defs,
+        64, // record size
+        .{},
+    );
+    defer isam_file.close();
+
+    // Store some records
+    const record1 = "KEY00001" ++ "Record 1 data here padded to 64 bytes.............";
+    const record2 = "KEY00002" ++ "Record 2 data here padded to 64 bytes.............";
+    const record3 = "KEY00003" ++ "Record 3 data here padded to 64 bytes.............";
+
+    _ = try isam_file.store(record1);
+    _ = try isam_file.store(record2);
+    _ = try isam_file.store(record3);
+
+    // Read by key
+    var buf: [64]u8 = undefined;
+    const len = try isam_file.read("KEY00002", &buf, .{ .match_mode = .exact });
+
+    try std.testing.expect(len > 0);
+    try std.testing.expect(std.mem.startsWith(u8, &buf, "KEY00002"));
+
+    // Test sequential access
+    isam_file.current_node = null; // Reset position
+    isam_file.current_position = 0;
+
+    // Read first
+    _ = try isam_file.read("KEY00001", &buf, .{ .match_mode = .greater_equal });
+    try std.testing.expect(std.mem.startsWith(u8, &buf, "KEY00001"));
+
+    // Read next
+    const len2 = try isam_file.readNext(&buf);
+    try std.testing.expect(len2 > 0);
+    try std.testing.expect(std.mem.startsWith(u8, &buf, "KEY00002"));
+
+    // Read next again
+    const len3 = try isam_file.readNext(&buf);
+    try std.testing.expect(len3 > 0);
+    try std.testing.expect(std.mem.startsWith(u8, &buf, "KEY00003"));
+
+    // Should hit EOF
+    const eof_result = isam_file.readNext(&buf);
+    try std.testing.expectError(IsamError.EndOfFile, eof_result);
+
+    // Clean up test files
+    std.fs.cwd().deleteFile("/tmp/test_isam.ism") catch {};
+    std.fs.cwd().deleteFile("/tmp/test_isam.is1") catch {};
+}
+
+test "isam persistence" {
+    const allocator = std.testing.allocator;
+
+    // Define a simple key on first 8 bytes
+    const key_segments = [_]KeyDef.KeySegment{
+        .{ .start = 0, .length = 8, .key_type = .alpha },
+    };
+    const key_defs = [_]KeyDef{
+        .{
+            .segments = &key_segments,
+            .allow_duplicates = false,
+            .changes_allowed = false,
+            .key_number = 0,
+        },
+    };
+
+    // Create and populate ISAM file
+    {
+        const isam_file = try IsamFile.create(
+            allocator,
+            "/tmp/test_persist",
+            &key_defs,
+            64,
+            .{},
+        );
+
+        const record1 = "AAAAAAAA" ++ "First record data padded to sixty-four bytes....";
+        const record2 = "BBBBBBBB" ++ "Second record data padded to sixty-four bytes...";
+        const record3 = "CCCCCCCC" ++ "Third record data padded to sixty-four bytes....";
+
+        _ = try isam_file.store(record1);
+        _ = try isam_file.store(record2);
+        _ = try isam_file.store(record3);
+
+        // Close (should persist to disk)
+        isam_file.close();
+    }
+
+    // Reopen and verify data is still there
+    {
+        const isam_file = try IsamFile.open(allocator, "/tmp/test_persist", .read_write);
+        defer isam_file.close();
+
+        var buf: [64]u8 = undefined;
+
+        // Read by key - should find records from previous session
+        const len1 = try isam_file.read("BBBBBBBB", &buf, .{ .match_mode = .exact });
+        try std.testing.expect(len1 > 0);
+        try std.testing.expect(std.mem.startsWith(u8, &buf, "BBBBBBBB"));
+
+        // Sequential read should work too
+        isam_file.current_node = null;
+        isam_file.current_position = 0;
+
+        _ = try isam_file.read("AAAAAAAA", &buf, .{ .match_mode = .greater_equal });
+        try std.testing.expect(std.mem.startsWith(u8, &buf, "AAAAAAAA"));
+
+        _ = try isam_file.readNext(&buf);
+        try std.testing.expect(std.mem.startsWith(u8, &buf, "BBBBBBBB"));
+
+        _ = try isam_file.readNext(&buf);
+        try std.testing.expect(std.mem.startsWith(u8, &buf, "CCCCCCCC"));
+    }
+
+    // Clean up test files
+    std.fs.cwd().deleteFile("/tmp/test_persist.ism") catch {};
+    std.fs.cwd().deleteFile("/tmp/test_persist.is1") catch {};
 }

@@ -147,6 +147,14 @@ pub const BTree = struct {
     }
 
     fn freeNode(self: *Self, node: *Node) void {
+        // Free key data
+        var i: usize = 0;
+        while (i < node.key_count) : (i += 1) {
+            if (node.keys[i].data.len > 0) {
+                self.allocator.free(@constCast(node.keys[i].data));
+            }
+        }
+
         if (!node.is_leaf) {
             for (node.children[0 .. node.key_count + 1]) |child| {
                 if (child) |c| {
@@ -246,11 +254,15 @@ pub const BTree = struct {
 
     /// Insert a key-record pair
     pub fn insert(self: *Self, key: Key, record: RecordPtr) !void {
+        // Copy the key data to owned memory
+        const owned_key_data = try self.allocator.dupe(u8, key.data);
+        const owned_key = Key{ .data = owned_key_data };
+
         if (self.root == null) {
             // Create root leaf
             const root = try self.allocator.create(Node);
             root.* = Node.init(true);
-            root.keys[0] = key;
+            root.keys[0] = owned_key;
             root.records[0] = record;
             root.key_count = 1;
             self.root = root;
@@ -269,11 +281,11 @@ pub const BTree = struct {
         // Insert into leaf
         if (!node.isFull()) {
             const pos = node.findKeyPosition(key);
-            node.insertKeyAt(pos, key, record);
+            node.insertKeyAt(pos, owned_key, record);
             self.size += 1;
         } else {
             // Node is full, need to split
-            try self.insertAndSplit(node, key, record);
+            try self.insertAndSplit(node, owned_key, record);
             self.size += 1;
         }
     }

@@ -1,43 +1,79 @@
-; isam_demo.dbl - ISAM file operations demo
+; isam_demo.dbl - ISAM Database Demo for Ziggy DBL
 ;
-; Demonstrates basic ISAM file operations
+; Demonstrates ISAM file operations:
+; - Creating ISAM files with XCALL ISAMC
+; - Opening ISAM files (mode "U:I" for Update+ISAM)
+; - Storing records
+; - Reading by key
+; - Sequential reads
+; - Using channel variables (SynergyDE style)
 
 record customer
-    cust_id         ,d8
-    cust_name       ,a50
-    balance         ,d12.2
-    status          ,a1
+    cust_id     ,a8     ; Key field (first 8 bytes)
+    cust_name   ,a30
+    balance     ,d10
 endrecord
 
 record
-    channel         ,i4
-    search_id       ,d8
+    tt          ,i4     ; Terminal channel
+    ch          ,i4     ; ISAM file channel
 endrecord
 
 proc
-    channel = 1
+    ; Open terminal for display output
+    open(tt, "O", "tt:")
 
-    ; Open ISAM file
-    open(channel, U:I, "customer.ism")
+    display(tt, "=== Ziggy ISAM Database Demo ===")
+    display(tt, "")
 
-    ; Store a new record
-    clear customer
-    cust_id = 10001
-    cust_name = "Acme Corporation"
-    balance = 1500.00
-    status = "A"
-    store(channel, customer)
+    ; Create ISAM file with XCALL ISAMC
+    ; ISAMC(file_spec, rec_size, num_keys, key_spec)
+    ; Record size = 8 + 30 + 10 = 48 bytes
+    ; Key: START=1, LENGTH=8 (cust_id field)
+    xcall ISAMC("customers", 48, 1, "START=1, LENGTH=8, TYPE=ALPHA")
+    display(tt, "Created ISAM file: customers")
 
-    ; Read record by key
-    search_id = 10001
-    read(channel, customer, search_id)
-    display(1, "Found: ", cust_name, " Balance: ", balance)
+    ; Open ISAM file for update
+    open(ch, "U:I", "customers")
+    display(tt, "Opened ISAM file: customers")
 
-    ; Update record
-    balance = balance + 500.00
-    write(channel, customer)
+    ; Store some customer records
+    cust_id = "CUST0001"
+    cust_name = "Alice Smith"
+    balance = 1500
+    store(ch, customer)
+    display(tt, "Stored: ", cust_id, " - ", cust_name)
 
-    ; Close file
-    close(channel)
+    cust_id = "CUST0002"
+    cust_name = "Bob Johnson"
+    balance = 2300
+    store(ch, customer)
+    display(tt, "Stored: ", cust_id, " - ", cust_name)
+
+    cust_id = "CUST0003"
+    cust_name = "Carol Williams"
+    balance = 980
+    store(ch, customer)
+    display(tt, "Stored: ", cust_id, " - ", cust_name)
+
+    display(tt, "")
+    display(tt, "--- Sequential Read (Key Order) ---")
+
+    ; Read sequentially through all records
+    reads(ch, customer)
+    display(tt, "Record 1: ", cust_id, " - ", cust_name, " Balance: ", balance)
+
+    reads(ch, customer)
+    display(tt, "Record 2: ", cust_id, " - ", cust_name, " Balance: ", balance)
+
+    reads(ch, customer)
+    display(tt, "Record 3: ", cust_id, " - ", cust_name, " Balance: ", balance)
+
+    ; Close the files
+    close(ch)
+    display(tt, "")
+    display(tt, "ISAM file closed.")
+    display(tt, "=== Demo Complete ===")
+    close(tt)
 
 end

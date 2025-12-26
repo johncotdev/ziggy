@@ -95,6 +95,7 @@ pub const Channel = struct {
     mode: FileMode,
     current_record: ?[]u8,
     is_locked: bool,
+    is_terminal: bool,
 
     pub const FileMode = enum {
         closed,
@@ -109,6 +110,7 @@ pub const Channel = struct {
 pub const Runtime = struct {
     allocator: std.mem.Allocator,
     variables: std.StringHashMap(Value),
+    records: std.StringHashMap(ast.RecordDef), // Track record definitions
     channels: [1024]Channel,
     call_stack: std.ArrayListAligned(CallFrame, null),
     output_buffer: std.ArrayListAligned(u8, null),
@@ -130,12 +132,14 @@ pub const Runtime = struct {
                 .mode = .closed,
                 .current_record = null,
                 .is_locked = false,
+                .is_terminal = false,
             };
         }
 
         return .{
             .allocator = allocator,
             .variables = std.StringHashMap(Value).init(allocator),
+            .records = std.StringHashMap(ast.RecordDef).init(allocator),
             .channels = channels,
             .call_stack = .empty,
             .output_buffer = .empty,
@@ -148,6 +152,9 @@ pub const Runtime = struct {
         for (&self.channels) |*ch| {
             if (ch.file) |*f| {
                 f.close();
+            }
+            if (ch.isam_file) |isam_file| {
+                isam_file.close();
             }
             if (ch.current_record) |rec| {
                 self.allocator.free(rec);
@@ -164,6 +171,7 @@ pub const Runtime = struct {
             }
         }
         self.variables.deinit();
+        self.records.deinit();
 
         // Free call stack
         for (self.call_stack.items) |*frame| {
@@ -208,6 +216,10 @@ pub const Runtime = struct {
             .xcall => |x| try self.executeXCall(x),
             .open_stmt => |o| try self.executeOpen(o),
             .close_stmt => |c| try self.executeClose(c),
+            .store_stmt => |s| try self.executeStore(s),
+            .read_stmt => |r| try self.executeRead(r),
+            .write_stmt => |w| try self.executeWrite(w),
+            .delete_stmt => |d| try self.executeDelete(d),
             .proc => {}, // PROC is just a marker
             .expression => |e| {
                 _ = try self.evaluateExpression(e);
@@ -223,6 +235,11 @@ pub const Runtime = struct {
         for (record.fields) |field| {
             const value = try self.createDefaultValue(field.data_type);
             try self.variables.put(field.name, value);
+        }
+
+        // Store record definition if it has a name
+        if (record.name) |name| {
+            try self.records.put(name, record);
         }
     }
 
@@ -250,17 +267,36 @@ pub const Runtime = struct {
     }
 
     fn executeDisplay(self: *Self, display: ast.DisplayStatement) RuntimeError!void {
-        // Channel 1 is typically stdout in DBL
-        const channel_num = try self.evaluateExpression(display.channel);
-        _ = channel_num;
+        const channel_num = (try self.evaluateExpression(display.channel)).toInteger();
+
+        // Build output string
+        var output = std.ArrayListAligned(u8, null).empty;
+        defer output.deinit(self.allocator);
 
         for (display.expressions) |expr| {
             const value = try self.evaluateExpression(expr);
             const str = try value.toString(self.allocator);
             defer self.allocator.free(str);
-            self.writeOutput(str);
+            output.appendSlice(self.allocator, str) catch {};
         }
-        self.writeOutput("\n");
+        output.append(self.allocator, '\n') catch {};
+
+        // Write to appropriate destination
+        if (channel_num > 0 and channel_num < 1024) {
+            const channel = &self.channels[@intCast(channel_num)];
+            if (channel.is_terminal or channel.mode != .closed) {
+                // Terminal channel or open file - write to stdout for terminal
+                if (channel.is_terminal) {
+                    self.writeOutput(output.items);
+                } else if (channel.file) |file| {
+                    _ = file.write(output.items) catch {};
+                }
+                return;
+            }
+        }
+
+        // Default: write to stdout (for channel 0 or unrecognized)
+        self.writeOutput(output.items);
     }
 
     fn executeClear(self: *Self, clear: ast.ClearStatement) RuntimeError!void {
@@ -302,47 +338,262 @@ pub const Runtime = struct {
     }
 
     fn executeXCall(self: *Self, xcall: ast.XCallStatement) RuntimeError!void {
-        // TODO: Implement built-in subroutine dispatch
-        _ = self;
-        _ = xcall;
+        // Dispatch to built-in subroutines
+        const routine_buf = self.allocator.alloc(u8, xcall.routine_name.len) catch return RuntimeError.OutOfMemory;
+        defer self.allocator.free(routine_buf);
+        const routine_name = std.ascii.lowerString(routine_buf, xcall.routine_name);
+
+        if (std.mem.eql(u8, routine_name, "isamc")) {
+            try self.executeIsamc(xcall.arguments);
+        } else {
+            // Unknown routine - for now just ignore
+        }
+    }
+
+    /// ISAMC - Create an ISAM file
+    /// xcall ISAMC(file_spec, rec_size, num_keys, key_spec, ...)
+    fn executeIsamc(self: *Self, args: []ast.Expression) RuntimeError!void {
+        if (args.len < 4) return RuntimeError.InvalidOperation;
+
+        // Parse file specification
+        const file_spec_val = try self.evaluateExpression(args[0]);
+        const file_spec = try file_spec_val.toString(self.allocator);
+        defer self.allocator.free(file_spec);
+
+        // Parse record size
+        const rec_size_val = try self.evaluateExpression(args[1]);
+        const rec_size: u32 = @intCast(rec_size_val.toInteger());
+
+        // Parse number of keys
+        const num_keys_val = try self.evaluateExpression(args[2]);
+        const num_keys: usize = @intCast(num_keys_val.toInteger());
+
+        if (num_keys == 0 or num_keys > 255) return RuntimeError.InvalidOperation;
+
+        // Parse key specifications
+        var key_defs = std.ArrayListAligned(isam.KeyDef, null).empty;
+        defer key_defs.deinit(self.allocator);
+
+        var key_segments_storage = std.ArrayListAligned([]isam.KeyDef.KeySegment, null).empty;
+        defer {
+            for (key_segments_storage.items) |segs| {
+                self.allocator.free(segs);
+            }
+            key_segments_storage.deinit(self.allocator);
+        }
+
+        var key_idx: usize = 0;
+        var arg_idx: usize = 3;
+        while (key_idx < num_keys and arg_idx < args.len) : ({
+            key_idx += 1;
+            arg_idx += 1;
+        }) {
+            const key_spec_val = try self.evaluateExpression(args[arg_idx]);
+            const key_spec = try key_spec_val.toString(self.allocator);
+            defer self.allocator.free(key_spec);
+
+            // Parse key specification string: "START=pos, LENGTH=len[, NAME=name][, TYPE=type]"
+            const parsed = try self.parseKeySpec(key_spec, @intCast(key_idx));
+            key_segments_storage.append(self.allocator, parsed.segments) catch return RuntimeError.OutOfMemory;
+            key_defs.append(self.allocator, .{
+                .segments = parsed.segments,
+                .allow_duplicates = parsed.allow_dups,
+                .changes_allowed = parsed.modifiable,
+                .key_number = @intCast(key_idx),
+            }) catch return RuntimeError.OutOfMemory;
+        }
+
+        if (key_defs.items.len == 0) return RuntimeError.InvalidOperation;
+
+        // Create the ISAM file
+        const isam_file = isam.IsamFile.create(
+            self.allocator,
+            file_spec,
+            key_defs.items,
+            rec_size,
+            .{},
+        ) catch return RuntimeError.FileNotOpen;
+
+        // Close it immediately (ISAMC just creates, doesn't keep open)
+        isam_file.close();
+    }
+
+    const ParsedKeySpec = struct {
+        segments: []isam.KeyDef.KeySegment,
+        allow_dups: bool,
+        modifiable: bool,
+    };
+
+    /// Parse a key specification string like "START=1, LENGTH=8, TYPE=ALPHA"
+    fn parseKeySpec(self: *Self, spec: []const u8, key_num: u8) RuntimeError!ParsedKeySpec {
+        _ = key_num;
+        var start: u32 = 0;
+        var length: u32 = 0;
+        var key_type: isam.KeyType = .alpha;
+        var allow_dups = false;
+        var modifiable = false;
+
+        // Simple parser for key=value pairs
+        var iter = std.mem.splitScalar(u8, spec, ',');
+        while (iter.next()) |part| {
+            const trimmed = std.mem.trim(u8, part, " \t");
+            if (std.mem.indexOf(u8, trimmed, "=")) |eq_pos| {
+                const key = std.mem.trim(u8, trimmed[0..eq_pos], " \t");
+                const value = std.mem.trim(u8, trimmed[eq_pos + 1 ..], " \t");
+
+                const key_buf = self.allocator.alloc(u8, key.len) catch return RuntimeError.OutOfMemory;
+                defer self.allocator.free(key_buf);
+                const key_lower = std.ascii.lowerString(key_buf, key);
+
+                if (std.mem.eql(u8, key_lower, "start")) {
+                    start = @intCast(std.fmt.parseInt(u32, value, 10) catch 0);
+                    if (start > 0) start -= 1; // Convert 1-based to 0-based
+                } else if (std.mem.eql(u8, key_lower, "length")) {
+                    length = @intCast(std.fmt.parseInt(u32, value, 10) catch 0);
+                } else if (std.mem.eql(u8, key_lower, "type")) {
+                    const val_buf = self.allocator.alloc(u8, value.len) catch return RuntimeError.OutOfMemory;
+                    defer self.allocator.free(val_buf);
+                    const val_lower = std.ascii.lowerString(val_buf, value);
+
+                    if (std.mem.eql(u8, val_lower, "nocase")) {
+                        key_type = .nocase;
+                    } else if (std.mem.eql(u8, val_lower, "decimal")) {
+                        key_type = .decimal;
+                    } else if (std.mem.eql(u8, val_lower, "integer")) {
+                        key_type = .integer;
+                    }
+                }
+            } else {
+                // Handle flags without values
+                const flag_buf = self.allocator.alloc(u8, trimmed.len) catch return RuntimeError.OutOfMemory;
+                defer self.allocator.free(flag_buf);
+                const flag_lower = std.ascii.lowerString(flag_buf, trimmed);
+
+                if (std.mem.eql(u8, flag_lower, "dups")) {
+                    allow_dups = true;
+                } else if (std.mem.eql(u8, flag_lower, "modify")) {
+                    modifiable = true;
+                }
+            }
+        }
+
+        if (length == 0) return RuntimeError.InvalidOperation;
+
+        // Create segment
+        const segments = self.allocator.alloc(isam.KeyDef.KeySegment, 1) catch
+            return RuntimeError.OutOfMemory;
+        segments[0] = .{
+            .start = start,
+            .length = length,
+            .key_type = key_type,
+        };
+
+        return .{
+            .segments = segments,
+            .allow_dups = allow_dups,
+            .modifiable = modifiable,
+        };
     }
 
     fn executeOpen(self: *Self, open: ast.OpenStatement) RuntimeError!void {
-        const channel_num = (try self.evaluateExpression(open.channel)).toInteger();
+        var channel_num = (try self.evaluateExpression(open.channel)).toInteger();
+
+        // Auto-assign channel if 0
+        if (channel_num == 0) {
+            // Find first available channel (start from 1)
+            var i: i64 = 1;
+            while (i < 1024) : (i += 1) {
+                if (self.channels[@intCast(i)].mode == .closed) {
+                    channel_num = i;
+                    // Update the variable with assigned channel
+                    switch (open.channel) {
+                        .identifier => |name| {
+                            try self.variables.put(name, Value{ .integer = channel_num });
+                        },
+                        else => {},
+                    }
+                    break;
+                }
+            }
+            if (channel_num == 0) return RuntimeError.InvalidOperation; // No free channels
+        }
+
         if (channel_num < 0 or channel_num >= 1024) return RuntimeError.InvalidOperation;
 
         const filename = try (try self.evaluateExpression(open.filename)).toString(self.allocator);
         defer self.allocator.free(filename);
 
         // Parse mode (e.g., "U:I" for Update ISAM)
-        const mode: Channel.FileMode = if (std.mem.startsWith(u8, open.mode, "I"))
+        // Strip quotes if present (from string literals)
+        const mode_str = blk: {
+            if (open.mode.len >= 2 and (open.mode[0] == '"' or open.mode[0] == '\'')) {
+                break :blk open.mode[1 .. open.mode.len - 1];
+            }
+            break :blk open.mode;
+        };
+
+        const mode: Channel.FileMode = if (std.mem.startsWith(u8, mode_str, "I"))
             .input
-        else if (std.mem.startsWith(u8, open.mode, "O"))
+        else if (std.mem.startsWith(u8, mode_str, "O"))
             .output
-        else if (std.mem.startsWith(u8, open.mode, "U"))
+        else if (std.mem.startsWith(u8, mode_str, "U"))
             .update
-        else if (std.mem.startsWith(u8, open.mode, "A"))
+        else if (std.mem.startsWith(u8, mode_str, "A"))
             .append
         else
             .input;
 
-        // For now, just use standard file I/O
-        const file = std.fs.cwd().openFile(filename, .{
-            .mode = switch (mode) {
-                .input => .read_only,
-                .output, .append => .write_only,
-                .update => .read_write,
-                else => .read_only,
-            },
-        }) catch return RuntimeError.FileNotOpen;
+        // Check for terminal device "tt:"
+        if (std.mem.eql(u8, filename, "tt:") or std.mem.eql(u8, filename, "TT:")) {
+            self.channels[@intCast(channel_num)] = .{
+                .file = null,
+                .isam_file = null,
+                .mode = mode,
+                .current_record = null,
+                .is_locked = false,
+                .is_terminal = true,
+            };
+            return;
+        }
 
-        self.channels[@intCast(channel_num)] = .{
-            .file = file,
-            .isam_file = null,
-            .mode = mode,
-            .current_record = null,
-            .is_locked = false,
-        };
+        // Check for ISAM mode (":I" suffix in mode string)
+        const is_isam = std.mem.indexOf(u8, mode_str, ":I") != null or
+            std.mem.indexOf(u8, mode_str, ":i") != null;
+
+        if (is_isam) {
+            // Open existing ISAM file (use ISAMC to create)
+            const isam_file = isam.IsamFile.open(self.allocator, filename, .read_write) catch {
+                return RuntimeError.FileNotOpen;
+            };
+
+            self.channels[@intCast(channel_num)] = .{
+                .file = null,
+                .isam_file = isam_file,
+                .mode = mode,
+                .current_record = null,
+                .is_locked = false,
+                .is_terminal = false,
+            };
+        } else {
+            // Standard file I/O
+            const file = std.fs.cwd().openFile(filename, .{
+                .mode = switch (mode) {
+                    .input => .read_only,
+                    .output, .append => .write_only,
+                    .update => .read_write,
+                    else => .read_only,
+                },
+            }) catch return RuntimeError.FileNotOpen;
+
+            self.channels[@intCast(channel_num)] = .{
+                .file = file,
+                .isam_file = null,
+                .mode = mode,
+                .current_record = null,
+                .is_locked = false,
+                .is_terminal = false,
+            };
+        }
     }
 
     fn executeClose(self: *Self, close: ast.CloseStatement) RuntimeError!void {
@@ -350,11 +601,219 @@ pub const Runtime = struct {
         if (channel_num < 0 or channel_num >= 1024) return RuntimeError.InvalidOperation;
 
         var channel = &self.channels[@intCast(channel_num)];
+
+        // Close regular file if open
         if (channel.file) |*f| {
             f.close();
             channel.file = null;
         }
+
+        // Close ISAM file if open
+        if (channel.isam_file) |isam_file| {
+            isam_file.close();
+            channel.isam_file = null;
+        }
+
+        // Free current record buffer
+        if (channel.current_record) |rec| {
+            self.allocator.free(rec);
+            channel.current_record = null;
+        }
+
         channel.mode = .closed;
+    }
+
+    fn executeStore(self: *Self, store: ast.StoreStatement) RuntimeError!void {
+        const channel_num = (try self.evaluateExpression(store.channel)).toInteger();
+        if (channel_num < 0 or channel_num >= 1024) return RuntimeError.InvalidOperation;
+
+        const channel = &self.channels[@intCast(channel_num)];
+
+        // Get record data from expression
+        const record_value = try self.evaluateExpression(store.record);
+        const record_data = try record_value.toString(self.allocator);
+        defer self.allocator.free(record_data);
+
+        if (channel.isam_file) |isam_file| {
+            // ISAM store
+            _ = isam_file.store(record_data) catch |err| {
+                return switch (err) {
+                    isam.IsamError.DuplicateKey => RuntimeError.InvalidOperation,
+                    isam.IsamError.IoError => RuntimeError.FileNotOpen,
+                    else => RuntimeError.InvalidOperation,
+                };
+            };
+        } else if (channel.file) |file| {
+            // Regular file write (append record)
+            _ = file.write(record_data) catch return RuntimeError.FileNotOpen;
+            _ = file.write("\n") catch return RuntimeError.FileNotOpen;
+        } else {
+            return RuntimeError.FileNotOpen;
+        }
+    }
+
+    fn executeRead(self: *Self, read_stmt: ast.ReadStatement) RuntimeError!void {
+        const channel_num = (try self.evaluateExpression(read_stmt.channel)).toInteger();
+        if (channel_num < 0 or channel_num >= 1024) return RuntimeError.InvalidOperation;
+
+        const channel = &self.channels[@intCast(channel_num)];
+
+        if (channel.isam_file) |isam_file| {
+            // Allocate record buffer
+            var record_buf: [4096]u8 = undefined;
+
+            if (read_stmt.key) |key_expr| {
+                // Keyed read (READ)
+                const key_value = try self.evaluateExpression(key_expr);
+                const key_data = try key_value.toString(self.allocator);
+                defer self.allocator.free(key_data);
+
+                // Parse qualifiers for match mode (default to exact for keyed reads)
+                var match_mode: isam.MatchMode = .exact;
+                var key_number: u8 = 0;
+                for (read_stmt.qualifiers) |qual| {
+                    if (std.mem.eql(u8, qual.name, "KEYNUM")) {
+                        if (qual.value) |v| {
+                            key_number = @intCast((try self.evaluateExpression(v)).toInteger());
+                        }
+                    } else if (std.mem.eql(u8, qual.name, "MATCH")) {
+                        // Q_EQ, Q_GEQ, Q_GTR, Q_PARTIAL
+                        if (qual.value) |v| {
+                            const mode_str = try (try self.evaluateExpression(v)).toString(self.allocator);
+                            defer self.allocator.free(mode_str);
+                            if (std.mem.eql(u8, mode_str, "Q_EQ")) {
+                                match_mode = .exact;
+                            } else if (std.mem.eql(u8, mode_str, "Q_GTR")) {
+                                match_mode = .greater;
+                            } else if (std.mem.eql(u8, mode_str, "Q_PARTIAL")) {
+                                match_mode = .partial;
+                            }
+                        }
+                    }
+                }
+
+                const len = isam_file.read(key_data, &record_buf, .{
+                    .key_number = key_number,
+                    .match_mode = match_mode,
+                }) catch |err| {
+                    return switch (err) {
+                        isam.IsamError.KeyNotFound => RuntimeError.KeyNotFound,
+                        isam.IsamError.EndOfFile => RuntimeError.KeyNotFound,
+                        else => RuntimeError.FileNotOpen,
+                    };
+                };
+
+                // Store record in target variable
+                try self.storeRecordValue(read_stmt.record, record_buf[0..len]);
+            } else {
+                // Sequential read (READS)
+                const len = isam_file.readNext(&record_buf) catch |err| {
+                    return switch (err) {
+                        isam.IsamError.EndOfFile => RuntimeError.KeyNotFound,
+                        else => RuntimeError.FileNotOpen,
+                    };
+                };
+
+                try self.storeRecordValue(read_stmt.record, record_buf[0..len]);
+            }
+        } else if (channel.file) |file| {
+            // Regular file read
+            var record_buf: [4096]u8 = undefined;
+            const bytes_read = file.read(&record_buf) catch return RuntimeError.FileNotOpen;
+            if (bytes_read == 0) return RuntimeError.KeyNotFound; // EOF
+
+            try self.storeRecordValue(read_stmt.record, record_buf[0..bytes_read]);
+        } else {
+            return RuntimeError.FileNotOpen;
+        }
+    }
+
+    fn executeWrite(self: *Self, write_stmt: ast.WriteStatement) RuntimeError!void {
+        const channel_num = (try self.evaluateExpression(write_stmt.channel)).toInteger();
+        if (channel_num < 0 or channel_num >= 1024) return RuntimeError.InvalidOperation;
+
+        const channel = &self.channels[@intCast(channel_num)];
+
+        // Get record data from expression
+        const record_value = try self.evaluateExpression(write_stmt.record);
+        const record_data = try record_value.toString(self.allocator);
+        defer self.allocator.free(record_data);
+
+        if (channel.isam_file) |isam_file| {
+            // ISAM write (update current record)
+            isam_file.write(record_data) catch |err| {
+                return switch (err) {
+                    isam.IsamError.KeyNotFound => RuntimeError.KeyNotFound,
+                    else => RuntimeError.FileNotOpen,
+                };
+            };
+        } else if (channel.file) |file| {
+            // Regular file write
+            _ = file.write(record_data) catch return RuntimeError.FileNotOpen;
+        } else {
+            return RuntimeError.FileNotOpen;
+        }
+    }
+
+    fn executeDelete(self: *Self, delete_stmt: ast.DeleteStatement) RuntimeError!void {
+        const channel_num = (try self.evaluateExpression(delete_stmt.channel)).toInteger();
+        if (channel_num < 0 or channel_num >= 1024) return RuntimeError.InvalidOperation;
+
+        const channel = &self.channels[@intCast(channel_num)];
+
+        if (channel.isam_file) |isam_file| {
+            isam_file.delete() catch |err| {
+                return switch (err) {
+                    isam.IsamError.KeyNotFound => RuntimeError.KeyNotFound,
+                    else => RuntimeError.FileNotOpen,
+                };
+            };
+        } else {
+            return RuntimeError.InvalidOperation; // DELETE only valid for ISAM
+        }
+    }
+
+    /// Helper to store record data into a variable or record fields
+    fn storeRecordValue(self: *Self, target: ast.Expression, data: []const u8) RuntimeError!void {
+        switch (target) {
+            .identifier => |name| {
+                // Check if it's a record name - if so, update individual fields
+                if (self.records.get(name)) |record| {
+                    var offset: usize = 0;
+                    for (record.fields) |field| {
+                        const field_size = self.getFieldSize(field.data_type);
+                        const end = @min(offset + field_size, data.len);
+
+                        if (offset < data.len) {
+                            // Get current field value (to free it if alpha)
+                            if (self.variables.get(field.name)) |current| {
+                                switch (current) {
+                                    .alpha => |a| self.allocator.free(a),
+                                    else => {},
+                                }
+                            }
+
+                            // Copy field data
+                            const src_len = end - offset;
+                            const buf = self.allocator.alloc(u8, field_size) catch return RuntimeError.OutOfMemory;
+                            @memset(buf, ' ');
+                            if (src_len > 0) {
+                                @memcpy(buf[0..src_len], data[offset..end]);
+                            }
+                            try self.variables.put(field.name, Value{ .alpha = buf });
+                        }
+                        offset += field_size;
+                    }
+                } else {
+                    // Simple variable - copy data to a new buffer
+                    const buf = self.allocator.dupe(u8, data) catch return RuntimeError.OutOfMemory;
+                    try self.variables.put(name, Value{ .alpha = buf });
+                }
+            },
+            else => {
+                // TODO: Handle member access, array indexing, etc.
+            },
+        }
     }
 
     /// Evaluate an expression to a value
@@ -362,12 +821,77 @@ pub const Runtime = struct {
         return switch (expr) {
             .integer => |i| Value{ .integer = i },
             .decimal => |d| Value{ .decimal = std.fmt.parseInt(i64, d, 10) catch 0 },
-            .string => |s| Value{ .string = s },
-            .identifier => |name| self.variables.get(name) orelse Value{ .null_val = {} },
+            .string => |s| Value{ .string = blk: {
+                // Strip quotes from string literals
+                if (s.len >= 2 and (s[0] == '"' or s[0] == '\'')) {
+                    break :blk s[1 .. s.len - 1];
+                }
+                break :blk s;
+            } },
+            .identifier => |name| blk: {
+                // First check if it's a variable
+                if (self.variables.get(name)) |val| {
+                    break :blk val;
+                }
+                // Then check if it's a record name - build buffer from fields
+                if (self.records.get(name)) |record| {
+                    const buf = try self.buildRecordBuffer(record);
+                    break :blk Value{ .alpha = buf };
+                }
+                break :blk Value{ .null_val = {} };
+            },
             .binary => |b| try self.evaluateBinary(b),
             .unary => |u| try self.evaluateUnary(u),
             .grouping => |g| try self.evaluateExpression(g.*),
             else => Value{ .null_val = {} },
+        };
+    }
+
+    /// Build a buffer from record fields
+    fn buildRecordBuffer(self: *Self, record: ast.RecordDef) RuntimeError![]u8 {
+        // Calculate total size
+        var total_size: usize = 0;
+        for (record.fields) |field| {
+            total_size += self.getFieldSize(field.data_type);
+        }
+
+        // Allocate buffer
+        const buf = self.allocator.alloc(u8, total_size) catch return RuntimeError.OutOfMemory;
+        @memset(buf, ' '); // Initialize with spaces
+
+        // Copy field values into buffer
+        var offset: usize = 0;
+        for (record.fields) |field| {
+            const field_size = self.getFieldSize(field.data_type);
+            if (self.variables.get(field.name)) |val| {
+                const str = val.toString(self.allocator) catch {
+                    continue;
+                };
+                defer self.allocator.free(str);
+                const copy_len = @min(str.len, field_size);
+                @memcpy(buf[offset .. offset + copy_len], str[0..copy_len]);
+            }
+            offset += field_size;
+        }
+
+        return buf;
+    }
+
+    /// Get the size of a data type
+    fn getFieldSize(self: *Self, data_type: ast.DataType) usize {
+        _ = self;
+        return switch (data_type) {
+            .alpha => |a| a.size orelse 1,
+            .decimal => |d| d.size orelse 1,
+            .implied_decimal => |id| id.total_digits,
+            .integer => |i| switch (i) {
+                .i1 => 1,
+                .i2 => 2,
+                .i4 => 4,
+                .i8 => 8,
+            },
+            .string => 256, // Default string size
+            else => 8,
         };
     }
 

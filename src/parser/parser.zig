@@ -498,7 +498,18 @@ pub const Parser = struct {
         const channel = try self.parseExpression();
         _ = try self.consume(.comma, "Expected ',' after channel");
 
-        const mode = try self.consume(.identifier, "Expected file mode");
+        // Mode can be identifier (U, I, O, A) or string ("U:I", "I:S", etc.)
+        const mode_token = self.peek();
+        const mode: []const u8 = if (mode_token.type == .string_literal) blk: {
+            _ = self.advance();
+            break :blk mode_token.lexeme;
+        } else if (mode_token.type == .identifier) blk: {
+            _ = self.advance();
+            break :blk mode_token.lexeme;
+        } else {
+            return ParseError.InvalidStatement;
+        };
+
         _ = try self.consume(.comma, "Expected ',' after mode");
 
         const filename = try self.parseExpression();
@@ -508,7 +519,7 @@ pub const Parser = struct {
         return ast.Statement{
             .open_stmt = .{
                 .channel = channel,
-                .mode = mode.lexeme,
+                .mode = mode,
                 .filename = filename,
                 .qualifiers = &[_]ast.Qualifier{},
             },
@@ -530,26 +541,124 @@ pub const Parser = struct {
 
     fn parseRead(self: *Self) ParseError!ast.Statement {
         _ = self.advance(); // consume 'read'
-        // TODO: Implement read parsing
-        return ParseError.InvalidStatement;
+
+        _ = try self.consume(.lparen, "Expected '(' after 'read'");
+
+        // Parse channel
+        const channel = try self.parseExpression();
+        _ = try self.consume(.comma, "Expected ',' after channel");
+
+        // Parse record variable
+        const record = try self.parseExpression();
+
+        // Parse optional key
+        var key: ?ast.Expression = null;
+        if (self.match(&[_]TokenType{.comma})) {
+            key = try self.parseExpression();
+        }
+
+        _ = try self.consume(.rparen, "Expected ')' after read arguments");
+
+        // Parse optional qualifiers
+        var qualifiers: std.ArrayListAligned(ast.Qualifier, null) = .empty;
+        errdefer qualifiers.deinit(self.allocator);
+
+        try self.parseQualifiers(&qualifiers);
+
+        return ast.Statement{
+            .read_stmt = .{
+                .channel = channel,
+                .record = record,
+                .key = key,
+                .qualifiers = qualifiers.toOwnedSlice(self.allocator) catch return ParseError.OutOfMemory,
+            },
+        };
     }
 
     fn parseReads(self: *Self) ParseError!ast.Statement {
         _ = self.advance(); // consume 'reads'
-        // TODO: Implement reads parsing
-        return ParseError.InvalidStatement;
+
+        _ = try self.consume(.lparen, "Expected '(' after 'reads'");
+
+        // Parse channel
+        const channel = try self.parseExpression();
+        _ = try self.consume(.comma, "Expected ',' after channel");
+
+        // Parse record variable
+        const record = try self.parseExpression();
+
+        _ = try self.consume(.rparen, "Expected ')' after reads arguments");
+
+        // Parse optional qualifiers
+        var qualifiers: std.ArrayListAligned(ast.Qualifier, null) = .empty;
+        errdefer qualifiers.deinit(self.allocator);
+
+        try self.parseQualifiers(&qualifiers);
+
+        // READS is like READ but with no key (sequential read)
+        return ast.Statement{
+            .read_stmt = .{
+                .channel = channel,
+                .record = record,
+                .key = null,
+                .qualifiers = qualifiers.toOwnedSlice(self.allocator) catch return ParseError.OutOfMemory,
+            },
+        };
     }
 
     fn parseWrite(self: *Self) ParseError!ast.Statement {
         _ = self.advance(); // consume 'write'
-        // TODO: Implement write parsing
-        return ParseError.InvalidStatement;
+
+        _ = try self.consume(.lparen, "Expected '(' after 'write'");
+
+        // Parse channel
+        const channel = try self.parseExpression();
+        _ = try self.consume(.comma, "Expected ',' after channel");
+
+        // Parse record variable
+        const record = try self.parseExpression();
+
+        _ = try self.consume(.rparen, "Expected ')' after write arguments");
+
+        // Parse optional qualifiers
+        var qualifiers: std.ArrayListAligned(ast.Qualifier, null) = .empty;
+        errdefer qualifiers.deinit(self.allocator);
+
+        try self.parseQualifiers(&qualifiers);
+
+        return ast.Statement{
+            .write_stmt = .{
+                .channel = channel,
+                .record = record,
+                .key = null,
+                .qualifiers = qualifiers.toOwnedSlice(self.allocator) catch return ParseError.OutOfMemory,
+            },
+        };
     }
 
     fn parseWrites(self: *Self) ParseError!ast.Statement {
         _ = self.advance(); // consume 'writes'
-        // TODO: Implement writes parsing
-        return ParseError.InvalidStatement;
+
+        _ = try self.consume(.lparen, "Expected '(' after 'writes'");
+
+        // Parse channel
+        const channel = try self.parseExpression();
+        _ = try self.consume(.comma, "Expected ',' after channel");
+
+        // Parse record variable
+        const record = try self.parseExpression();
+
+        _ = try self.consume(.rparen, "Expected ')' after writes arguments");
+
+        // WRITES is for sequential file output, using write_stmt
+        return ast.Statement{
+            .write_stmt = .{
+                .channel = channel,
+                .record = record,
+                .key = null,
+                .qualifiers = &[_]ast.Qualifier{},
+            },
+        };
     }
 
     fn parseDisplay(self: *Self) ParseError!ast.Statement {
@@ -577,14 +686,83 @@ pub const Parser = struct {
 
     fn parseStore(self: *Self) ParseError!ast.Statement {
         _ = self.advance(); // consume 'store'
-        // TODO: Implement store parsing
-        return ParseError.InvalidStatement;
+
+        _ = try self.consume(.lparen, "Expected '(' after 'store'");
+
+        // Parse channel
+        const channel = try self.parseExpression();
+        _ = try self.consume(.comma, "Expected ',' after channel");
+
+        // Parse record variable
+        const record = try self.parseExpression();
+
+        _ = try self.consume(.rparen, "Expected ')' after store arguments");
+
+        // Parse optional qualifiers
+        var qualifiers: std.ArrayListAligned(ast.Qualifier, null) = .empty;
+        errdefer qualifiers.deinit(self.allocator);
+
+        try self.parseQualifiers(&qualifiers);
+
+        return ast.Statement{
+            .store_stmt = .{
+                .channel = channel,
+                .record = record,
+                .qualifiers = qualifiers.toOwnedSlice(self.allocator) catch return ParseError.OutOfMemory,
+            },
+        };
     }
 
     fn parseDelete(self: *Self) ParseError!ast.Statement {
         _ = self.advance(); // consume 'delete'
-        // TODO: Implement delete parsing
-        return ParseError.InvalidStatement;
+
+        _ = try self.consume(.lparen, "Expected '(' after 'delete'");
+
+        // Parse channel
+        const channel = try self.parseExpression();
+
+        _ = try self.consume(.rparen, "Expected ')' after delete arguments");
+
+        return ast.Statement{
+            .delete_stmt = .{
+                .channel = channel,
+            },
+        };
+    }
+
+    /// Parse optional qualifiers like [KEYNUM:1, LOCK, WAIT]
+    fn parseQualifiers(self: *Self, qualifiers: *std.ArrayListAligned(ast.Qualifier, null)) ParseError!void {
+        // Check for qualifier block starting with [
+        if (!self.match(&[_]TokenType{.lbracket})) {
+            return;
+        }
+
+        while (true) {
+            // Expect identifier for qualifier name
+            if (self.peek().type != .identifier) {
+                break;
+            }
+
+            const name = self.advance().lexeme;
+            var value: ?ast.Expression = null;
+
+            // Check for value after colon
+            if (self.match(&[_]TokenType{.colon})) {
+                value = try self.parseExpression();
+            }
+
+            try qualifiers.append(self.allocator, .{
+                .name = name,
+                .value = value,
+            });
+
+            // Continue if there's a comma
+            if (!self.match(&[_]TokenType{.comma})) {
+                break;
+            }
+        }
+
+        _ = try self.consume(.rbracket, "Expected ']' after qualifiers");
     }
 
     // ============================================================
