@@ -19,6 +19,7 @@ const std = @import("std");
 
 // Core compiler modules
 pub const lexer = @import("lexer/lexer.zig");
+pub const token = @import("lexer/token.zig");
 pub const parser = @import("parser/parser.zig");
 pub const ast = @import("ast/ast.zig");
 
