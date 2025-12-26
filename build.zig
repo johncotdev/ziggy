@@ -89,6 +89,37 @@ pub fn build(b: *std.Build) void {
     // by passing `--prefix` or `-p`.
     b.installArtifact(exe);
 
+    // ========================================================================
+    // Shared Library for C ABI (.NET P/Invoke)
+    // ========================================================================
+    // This creates a shared library (.dylib on macOS, .dll on Windows, .so on Linux)
+    // that exposes C-compatible functions for use from .NET via P/Invoke.
+    const lib = b.addLibrary(.{
+        .linkage = .dynamic,
+        .name = "ziggy_isam",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/isam/cabi.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    // Install the shared library
+    b.installArtifact(lib);
+
+    // Also create a static library for embedding
+    const static_lib = b.addLibrary(.{
+        .linkage = .static,
+        .name = "ziggy_isam_static",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/isam/cabi.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    b.installArtifact(static_lib);
+
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).
     // This will evaluate the `run` step rather than the default step.

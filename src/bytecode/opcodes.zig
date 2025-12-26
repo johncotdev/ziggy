@@ -1,4 +1,4 @@
-//! Ziggy DBL Bytecode Opcodes
+//! Zibol Bytecode Opcodes
 //!
 //! Defines the instruction set for the Ziggy virtual machine.
 

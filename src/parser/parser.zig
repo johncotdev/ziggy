@@ -1,4 +1,4 @@
-//! Ziggy DBL Parser
+//! Zibol Parser
 //!
 //! Parses a stream of tokens into an Abstract Syntax Tree.
 
@@ -84,6 +84,8 @@ pub const Parser = struct {
 
             // Procedure division
             .kw_proc => self.parseProc(),
+            .kw_function => self.parseFunction(),
+            .kw_subroutine => self.parseSubroutine(),
             .kw_if => self.parseIf(),
             .kw_case => self.parseCase(),
             .kw_using => self.parseUsing(),
@@ -300,6 +302,147 @@ pub const Parser = struct {
     fn parseProc(self: *Self) ParseError!ast.Statement {
         _ = self.advance(); // consume 'proc'
         return ast.Statement{ .proc = .{} };
+    }
+
+    /// Parse a function definition
+    /// Syntax: function name, return_type [, export_name]
+    ///         [parameters...]
+    ///         proc
+    ///         [body...]
+    ///         endfunction
+    fn parseFunction(self: *Self) ParseError!ast.Statement {
+        _ = self.advance(); // consume 'function'
+
+        const name = try self.consume(.identifier, "Expected function name");
+
+        // Return type after comma
+        _ = try self.consume(.comma, "Expected ',' after function name");
+        const return_type = try self.parseDataType();
+
+        // Optional export name
+        var export_name: ?[]const u8 = null;
+        if (self.match(&[_]TokenType{.comma})) {
+            if (self.peek().type == .string_literal) {
+                const exp_tok = self.advance();
+                // Remove quotes from export name
+                if (exp_tok.lexeme.len >= 2) {
+                    export_name = exp_tok.lexeme[1 .. exp_tok.lexeme.len - 1];
+                }
+            }
+        }
+
+        // Parse parameters (fields before PROC)
+        var params: std.ArrayListAligned(ast.ParameterDef, null) = .empty;
+        errdefer params.deinit(self.allocator);
+
+        while (!self.check(.kw_proc) and !self.check(.kw_endfunction) and !self.isAtEnd()) {
+            const param = try self.parseParameterDef();
+            try params.append(self.allocator, param);
+        }
+
+        // Optional PROC marker
+        _ = self.match(&[_]TokenType{.kw_proc});
+
+        // Parse body statements
+        var body: std.ArrayListAligned(ast.Statement, null) = .empty;
+        errdefer {
+            for (body.items) |*stmt| {
+                stmt.deinit(self.allocator);
+            }
+            body.deinit(self.allocator);
+        }
+
+        while (!self.check(.kw_endfunction) and !self.isAtEnd()) {
+            const stmt = try self.parseStatement();
+            try body.append(self.allocator, stmt);
+        }
+
+        _ = try self.consume(.kw_endfunction, "Expected 'endfunction'");
+
+        return ast.Statement{
+            .function_def = .{
+                .name = name.lexeme,
+                .return_type = return_type,
+                .parameters = params.toOwnedSlice(self.allocator) catch return ParseError.OutOfMemory,
+                .body = body.toOwnedSlice(self.allocator) catch return ParseError.OutOfMemory,
+                .export_name = export_name,
+                .is_static = false,
+            },
+        };
+    }
+
+    /// Parse a subroutine definition
+    /// Syntax: subroutine name [, export_name]
+    ///         [parameters...]
+    ///         proc
+    ///         [body...]
+    ///         endsubroutine
+    fn parseSubroutine(self: *Self) ParseError!ast.Statement {
+        _ = self.advance(); // consume 'subroutine'
+
+        const name = try self.consume(.identifier, "Expected subroutine name");
+
+        // Optional export name
+        var export_name: ?[]const u8 = null;
+        if (self.match(&[_]TokenType{.comma})) {
+            if (self.peek().type == .string_literal) {
+                const exp_tok = self.advance();
+                // Remove quotes
+                if (exp_tok.lexeme.len >= 2) {
+                    export_name = exp_tok.lexeme[1 .. exp_tok.lexeme.len - 1];
+                }
+            }
+        }
+
+        // Parse parameters
+        var params: std.ArrayListAligned(ast.ParameterDef, null) = .empty;
+        errdefer params.deinit(self.allocator);
+
+        while (!self.check(.kw_proc) and !self.check(.kw_endsubroutine) and !self.isAtEnd()) {
+            const param = try self.parseParameterDef();
+            try params.append(self.allocator, param);
+        }
+
+        // Optional PROC marker
+        _ = self.match(&[_]TokenType{.kw_proc});
+
+        // Parse body
+        var body: std.ArrayListAligned(ast.Statement, null) = .empty;
+        errdefer {
+            for (body.items) |*stmt| {
+                stmt.deinit(self.allocator);
+            }
+            body.deinit(self.allocator);
+        }
+
+        while (!self.check(.kw_endsubroutine) and !self.isAtEnd()) {
+            const stmt = try self.parseStatement();
+            try body.append(self.allocator, stmt);
+        }
+
+        _ = try self.consume(.kw_endsubroutine, "Expected 'endsubroutine'");
+
+        return ast.Statement{
+            .subroutine_def = .{
+                .name = name.lexeme,
+                .parameters = params.toOwnedSlice(self.allocator) catch return ParseError.OutOfMemory,
+                .body = body.toOwnedSlice(self.allocator) catch return ParseError.OutOfMemory,
+                .export_name = export_name,
+                .is_external = false,
+            },
+        };
+    }
+
+    /// Parse a parameter definition for function/subroutine
+    fn parseParameterDef(self: *Self) ParseError!ast.ParameterDef {
+        const name = try self.consume(.identifier, "Expected parameter name");
+        _ = try self.consume(.comma, "Expected ',' after parameter name");
+        const data_type = try self.parseDataType();
+
+        return ast.ParameterDef{
+            .name = name.lexeme,
+            .data_type = data_type,
+        };
     }
 
     fn parseIf(self: *Self) ParseError!ast.Statement {

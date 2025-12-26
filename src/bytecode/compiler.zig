@@ -1,4 +1,4 @@
-//! Ziggy DBL Bytecode Compiler
+//! Zibol Bytecode Compiler
 //!
 //! Transforms AST into executable bytecode modules.
 

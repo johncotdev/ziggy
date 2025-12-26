@@ -1,6 +1,6 @@
-//! Ziggy DBL Built-in Functions and Subroutines
+//! Zibol Built-in Functions and Subroutines
 //!
-//! Implements the standard DBL library functions.
+//! Implements the standard Zibol library functions.
 
 const std = @import("std");
 const runtime = @import("../runtime/runtime.zig");

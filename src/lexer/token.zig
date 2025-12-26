@@ -1,4 +1,4 @@
-//! Token types for Ziggy DBL Lexer
+//! Token types for Zibol Lexer
 
 const std = @import("std");
 
@@ -26,7 +26,7 @@ pub const Token = struct {
     }
 };
 
-/// All token types in DBL
+/// All token types in Zibol
 pub const TokenType = enum {
     // Literals
     identifier,

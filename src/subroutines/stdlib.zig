@@ -1,9 +1,9 @@
-//! Ziggy DBL Standard Library
+//! Zibol Standard Library
 //!
-//! Manages the standard library of subroutines available to all DBL programs.
+//! Manages the standard library of subroutines available to all Zibol programs.
 //! The stdlib combines:
 //! - Native (Zig) implementations for performance-critical and system-level code
-//! - DBL implementations for higher-level utilities (once bytecode loading works)
+//! - Zibol implementations for higher-level utilities (once bytecode loading works)
 
 const std = @import("std");
 const SubroutineRegistry = @import("subroutines.zig").SubroutineRegistry;
@@ -51,9 +51,9 @@ pub const Stdlib = struct {
         // Register additional native subroutines for stdlib
         try self.registerStdlibNatives();
 
-        // Load compiled DBL stdlib modules if stdlib path is set
+        // Load compiled Zibol stdlib modules if stdlib path is set
         if (self.stdlib_path) |path| {
-            try self.loadDblModules(path);
+            try self.loadZblModules(path);
         }
     }
 
@@ -84,8 +84,8 @@ pub const Stdlib = struct {
         try self.registry.registerNative("mem_free", native_mem_free);
     }
 
-    /// Load DBL stdlib modules from path
-    fn loadDblModules(self: *Self, path: []const u8) !void {
+    /// Load Zibol stdlib modules from path
+    fn loadZblModules(self: *Self, path: []const u8) !void {
         // Try to open the stdlib directory
         var dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch return;
         defer dir.close();

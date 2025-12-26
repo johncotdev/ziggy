@@ -1,10 +1,10 @@
-//! Ziggy DBL - Command Line Interface
+//! Ziggy - Zibol Compiler and Runtime
 //!
 //! Usage:
-//!   ziggy <file.dbl>              Run a DBL program (interpreter)
-//!   ziggy run <file.dbl|.zbc>     Run a program (auto-detect mode)
-//!   ziggy compile <file.dbl>      Compile to bytecode (.zbc)
-//!   ziggy disasm <file.dbl|.zbc>  Disassemble to readable output
+//!   ziggy <file.zbl>              Run a Zibol program (interpreter)
+//!   ziggy run <file.zbl|.zbc>     Run a program (auto-detect mode)
+//!   ziggy compile <file.zbl>      Compile to bytecode (.zbc)
+//!   ziggy disasm <file.zbl|.zbc>  Disassemble to readable output
 //!   ziggy repl                    Start interactive REPL
 //!   ziggy --help                  Show help
 //!   ziggy --version               Show version
@@ -36,7 +36,7 @@ pub fn main() !void {
     } else if (std.mem.eql(u8, command, "compile")) {
         if (args.len < 3) {
             try printErr("Error: compile requires a filename\n");
-            try printErr("Usage: ziggy compile <file.dbl> [-o output.zbc]\n");
+            try printErr("Usage: ziggy compile <file.zbl> [-o output.zbc]\n");
             return;
         }
         const output_file = if (args.len >= 5 and std.mem.eql(u8, args[3], "-o"))
@@ -47,14 +47,14 @@ pub fn main() !void {
     } else if (std.mem.eql(u8, command, "disasm")) {
         if (args.len < 3) {
             try printErr("Error: disasm requires a filename\n");
-            try printErr("Usage: ziggy disasm <file.dbl|file.zbc>\n");
+            try printErr("Usage: ziggy disasm <file.zbl|file.zbc>\n");
             return;
         }
         try disasmFile(allocator, args[2]);
     } else if (std.mem.eql(u8, command, "run")) {
         if (args.len < 3) {
             try printErr("Error: run requires a filename\n");
-            try printErr("Usage: ziggy run <file.dbl|file.zbc>\n");
+            try printErr("Usage: ziggy run <file.zbl|file.zbc>\n");
             return;
         }
         try runFileAuto(allocator, args[2]);
@@ -71,13 +71,13 @@ fn printUsage() !void {
     const stdout = &stdout_writer.interface;
 
     try stdout.writeAll(
-        \\Ziggy DBL - A Zig implementation of Synergy DBL
+        \\Ziggy - Zibol Compiler and Runtime
         \\
         \\Usage:
-        \\  ziggy <file.dbl>              Run a DBL program (interpreter)
-        \\  ziggy run <file.dbl|.zbc>     Run a program (auto-detect mode)
-        \\  ziggy compile <file.dbl>      Compile to bytecode (.zbc)
-        \\  ziggy disasm <file.dbl|.zbc>  Disassemble to readable output
+        \\  ziggy <file.zbl>              Run a Zibol program (interpreter)
+        \\  ziggy run <file.zbl|.zbc>     Run a program (auto-detect mode)
+        \\  ziggy compile <file.zbl>      Compile to bytecode (.zbc)
+        \\  ziggy disasm <file.zbl|.zbc>  Disassemble to readable output
         \\  ziggy repl                    Start interactive REPL
         \\  ziggy --help                  Show this help message
         \\  ziggy --version               Show version information
@@ -86,11 +86,11 @@ fn printUsage() !void {
         \\  -o <file>                     Output file (default: <input>.zbc)
         \\
         \\Examples:
-        \\  ziggy hello.dbl               Run hello.dbl with interpreter
-        \\  ziggy compile hello.dbl       Compile to hello.zbc
-        \\  ziggy compile hello.dbl -o bin/hello.zbc
+        \\  ziggy hello.zbl               Run hello.zbl with interpreter
+        \\  ziggy compile hello.zbl       Compile to hello.zbc
+        \\  ziggy compile hello.zbl -o bin/hello.zbc
         \\  ziggy run bin/hello.zbc       Run compiled bytecode
-        \\  ziggy disasm hello.dbl        Show bytecode disassembly
+        \\  ziggy disasm hello.zbl        Show bytecode disassembly
         \\
     );
     try stdout.flush();
@@ -102,8 +102,8 @@ fn printVersion() !void {
     var stdout_writer = stdout_file.writer(&stdout_buffer);
     const stdout = &stdout_writer.interface;
 
-    try stdout.print("Ziggy DBL version {s}\n", .{ziggy.version});
-    try stdout.writeAll("A Zig implementation of Synergy DBL\n");
+    try stdout.print("Ziggy version {s}\n", .{ziggy.version});
+    try stdout.writeAll("Zibol - Zig Business Oriented Language\n");
     try stdout.writeAll("https://github.com/johncotdev/ziggy\n");
     try stdout.flush();
 }
@@ -229,8 +229,8 @@ fn compileFile(allocator: std.mem.Allocator, filename: []const u8, output_file: 
     const out_name = if (output_file) |of|
         of
     else blk: {
-        // Replace .dbl with .zbc
-        if (std.mem.endsWith(u8, filename, ".dbl") or std.mem.endsWith(u8, filename, ".DBL")) {
+        // Replace .zbl with .zbc
+        if (std.mem.endsWith(u8, filename, ".zbl") or std.mem.endsWith(u8, filename, ".ZBL")) {
             const base = filename[0 .. filename.len - 4];
             break :blk try std.fmt.allocPrint(allocator, "{s}.zbc", .{base});
         } else {
@@ -341,9 +341,9 @@ fn disasmFile(allocator: std.mem.Allocator, filename: []const u8) !void {
 
 fn runRepl(allocator: std.mem.Allocator) !void {
     _ = allocator;
-    try printStdout("Ziggy DBL REPL v{s}\n", .{ziggy.version});
+    try printStdout("Zibol REPL v{s}\n", .{ziggy.version});
     try printErr("REPL not yet implemented.\n");
-    try printErr("Use: ziggy <file.dbl> to run a DBL program\n");
+    try printErr("Use: ziggy <file.zbl> to run a Zibol program\n");
 }
 
 test "main module loads" {

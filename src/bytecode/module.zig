@@ -1,4 +1,4 @@
-//! Ziggy DBL Bytecode Module Format
+//! Zibol Bytecode Module Format
 //!
 //! Defines the structure of compiled bytecode modules (.zbc files).
 

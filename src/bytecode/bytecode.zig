@@ -1,7 +1,7 @@
-//! Ziggy DBL Bytecode Module
+//! Zibol Bytecode Module
 //!
 //! This module provides the bytecode compiler, module format, and virtual machine
-//! for executing compiled Ziggy DBL programs.
+//! for executing compiled Zibol programs.
 
 pub const opcodes = @import("opcodes.zig");
 pub const module = @import("module.zig");

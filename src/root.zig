@@ -1,11 +1,16 @@
-//! Ziggy DBL - A Zig implementation of the Synergy DBL language
+//! Ziggy - A Zig implementation of the Zibol language
+//!
+//! Zibol (Zig Business Oriented Language) is a modern business programming
+//! language inspired by DIBOL/DBL and COBOL, designed for migrating and
+//! modernizing legacy business applications.
 //!
 //! This library provides:
-//! - Lexer: Tokenizes DBL source code
+//! - Lexer: Tokenizes Zibol (.zbl) source code
 //! - Parser: Builds an AST from tokens
 //! - AST: Abstract Syntax Tree types
+//! - IR: Intermediate Representation for multiple backends
 //! - Runtime: Interpreter and execution environment
-//! - ISAM: Indexed Sequential Access Method database
+//! - ZiggyDB: ISAM database engine
 //! - Builtins: Built-in functions and subroutines
 //! - Bytecode: Bytecode compiler and VM
 //! - Subroutines: XCALL subroutine registry
@@ -24,16 +29,22 @@ pub const builtins = @import("builtins/builtins.zig");
 // Bytecode compiler and VM
 pub const bytecode = @import("bytecode/bytecode.zig");
 
+// Intermediate Representation
+pub const ir = @import("ir/ir.zig");
+pub const ir_lower = @import("ir/lower.zig");
+pub const ir_printer = @import("ir/printer.zig");
+pub const ir_emit_zig = @import("ir/emit_zig.zig");
+
 // Subroutine registry
 pub const subroutines = @import("subroutines/subroutines.zig");
 
-// ISAM database
+// ZiggyDB - ISAM database engine
 pub const isam = @import("isam/isam.zig");
 
 /// Library version
 pub const version = "0.1.0";
 
-/// Compile and execute DBL source code
+/// Compile and execute Zibol source code
 pub fn run(allocator: std.mem.Allocator, source: []const u8) !void {
     // Tokenize
     var lex = lexer.Lexer.init(source);
@@ -52,7 +63,7 @@ pub fn run(allocator: std.mem.Allocator, source: []const u8) !void {
     try rt.execute(program);
 }
 
-/// Compile DBL source to bytecode (future)
+/// Compile Zibol source to bytecode (future)
 pub fn compile(allocator: std.mem.Allocator, source: []const u8) ![]const u8 {
     _ = allocator;
     _ = source;

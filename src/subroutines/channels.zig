@@ -1,4 +1,4 @@
-//! Ziggy DBL Channel Manager
+//! Zibol Channel Manager
 //!
 //! Manages I/O channels for file operations, terminal I/O, and ISAM files.
 //! Channels are numbered 0-255 and can be bound to various I/O targets.

@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RootNamespace>Ziggy.Isam</RootNamespace>
+    <AssemblyName>ZiggyIsam</AssemblyName>
+    <Version>0.1.0</Version>
+    <Authors>Ziggy DBL Project</Authors>
+    <Description>Ziggy ISAM .NET interop library for accessing Ziggy DBL ISAM databases</Description>
+  </PropertyGroup>
+
+  <!-- Native library paths for different platforms -->
+  <ItemGroup>
+    <!-- macOS -->
+    <None Include="../zig-out/lib/libziggy_isam.dylib"
+          CopyToOutputDirectory="PreserveNewest"
+          Condition="Exists('../zig-out/lib/libziggy_isam.dylib')" />
+
+    <!-- Linux -->
+    <None Include="../zig-out/lib/libziggy_isam.so"
+          CopyToOutputDirectory="PreserveNewest"
+          Condition="Exists('../zig-out/lib/libziggy_isam.so')" />
+
+    <!-- Windows -->
+    <None Include="../zig-out/lib/ziggy_isam.dll"
+          CopyToOutputDirectory="PreserveNewest"
+          Condition="Exists('../zig-out/lib/ziggy_isam.dll')" />
+  </ItemGroup>
+
+</Project>

@@ -1,6 +1,6 @@
-//! Ziggy DBL Virtual Machine
+//! Zibol Virtual Machine
 //!
-//! Stack-based bytecode interpreter for compiled Ziggy DBL programs.
+//! Stack-based bytecode interpreter for compiled Zibol programs.
 
 const std = @import("std");
 const Opcode = @import("opcodes.zig").Opcode;

@@ -1,7 +1,7 @@
-//! Ziggy DBL Lexer
+//! Zibol Lexer
 //!
-//! Tokenizes DBL source code into a stream of tokens.
-//! DBL is case-insensitive for keywords and identifiers.
+//! Tokenizes Zibol source code into a stream of tokens.
+//! Zibol is case-insensitive for keywords and identifiers.
 
 const std = @import("std");
 const Token = @import("token.zig").Token;

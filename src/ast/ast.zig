@@ -1,11 +1,11 @@
-//! Abstract Syntax Tree types for Ziggy DBL
+//! Abstract Syntax Tree types for Zibol
 //!
-//! Represents the parsed structure of a DBL program.
+//! Represents the parsed structure of a Zibol (.zbl) program.
 
 const std = @import("std");
 const Token = @import("../lexer/token.zig").Token;
 
-/// A complete DBL program
+/// A complete Zibol program
 pub const Program = struct {
     statements: []Statement,
     allocator: std.mem.Allocator,
@@ -25,7 +25,7 @@ pub const Program = struct {
     }
 };
 
-/// Statement types in DBL
+/// Statement types in Zibol
 pub const Statement = union(enum) {
     // Data division
     record: RecordDef,
@@ -64,6 +64,10 @@ pub const Statement = union(enum) {
     class: ClassDef,
     method: MethodDef,
     namespace: NamespaceDef,
+
+    // Function/Subroutine definitions
+    function_def: FunctionDef,
+    subroutine_def: SubroutineDef,
 
     // Expression statement
     expression: Expression,
@@ -125,7 +129,7 @@ pub const FieldDef = struct {
     array_dims: ?[]usize,
 };
 
-/// DBL Data types
+/// Zibol Data types
 pub const DataType = union(enum) {
     alpha: AlphaType,
     decimal: DecimalType,
@@ -380,6 +384,36 @@ pub const AccessModifier = enum {
 pub const NamespaceDef = struct {
     name: []const u8,
     members: []Statement,
+};
+
+/// Function definition (returns a value)
+/// Syntax: function name, type [, export_name]
+///         parameters...
+///         endfunction
+pub const FunctionDef = struct {
+    name: []const u8,
+    return_type: DataType,
+    parameters: []ParameterDef,
+    body: []Statement,
+    export_name: ?[]const u8, // For .NET interop: .export "ziggy_function_name"
+    is_static: bool,
+
+    pub const Linkage = enum {
+        internal, // Default, not exported
+        export_c, // Export with C ABI for .NET P/Invoke
+    };
+};
+
+/// Subroutine definition (no return value)
+/// Syntax: subroutine name [, export_name]
+///         parameters...
+///         endsubroutine
+pub const SubroutineDef = struct {
+    name: []const u8,
+    parameters: []ParameterDef,
+    body: []Statement,
+    export_name: ?[]const u8, // For .NET interop
+    is_external: bool, // EXTERNAL subroutine (declaration only)
 };
 
 /// Expression types

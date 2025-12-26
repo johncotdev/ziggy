@@ -1,7 +1,7 @@
-//! Ziggy ISAM - Indexed Sequential Access Method
+//! ZiggyDB - Indexed Sequential Access Method Database
 //!
-//! A Zig implementation of ISAM file storage, compatible with
-//! Synergy DBL ISAM semantics.
+//! A Zig implementation of ISAM file storage for Zibol,
+//! compatible with Synergy DBL ISAM semantics.
 //!
 //! Features:
 //! - Single-file database format (.zdb) for atomic operations and easy deployment
@@ -26,7 +26,15 @@
 const std = @import("std");
 const btree = @import("btree.zig");
 const ulid_mod = @import("ulid.zig");
+const schema_mod = @import("schema.zig");
+
 pub const ULID = ulid_mod.ULID;
+pub const Schema = schema_mod.Schema;
+pub const TableDef = schema_mod.TableDef;
+pub const FieldDef = schema_mod.FieldDef;
+pub const FieldType = schema_mod.FieldType;
+pub const SchemaBuilder = schema_mod.SchemaBuilder;
+pub const TableBuilder = schema_mod.TableBuilder;
 
 /// Single-file magic number
 pub const MAGIC = [8]u8{ 'Z', 'I', 'G', 'G', 'Y', 'D', 'B', 0 };
@@ -142,24 +150,38 @@ pub const LockMode = enum {
     manual_lock,
 };
 
+/// Header flags
+pub const HeaderFlags = packed struct(u16) {
+    /// File has embedded schema
+    has_schema: bool = false,
+    /// Schema is multi-table (has tag byte)
+    multi_table: bool = false,
+    /// Compression enabled
+    compressed: bool = false,
+    /// Reserved
+    _reserved: u13 = 0,
+};
+
 /// Single-file header (256 bytes, stored at start of .zdb file)
 pub const FileHeader = struct {
     magic: [8]u8, // "ZIGGYDB\0"
     version: u32, // File format version
     page_size: u32, // Page size (default 4096)
     key_count: u16, // Number of user-defined keys
-    flags: u16, // Feature flags
+    flags: HeaderFlags, // Feature flags
     record_count: u64, // Total records in file
     record_size: u32, // Fixed record size
     record_type: RecordType, // Fixed/variable
     _padding1: [3]u8, // Alignment padding
     key_defs_offset: u64, // Offset to key definitions
     key_defs_size: u64, // Size of key definitions region
+    schema_offset: u64, // Offset to schema region (0 if no schema)
+    schema_size: u64, // Size of schema region
     index_offset: u64, // Offset to index region
     index_size: u64, // Size of index region
     data_offset: u64, // Offset to data region
     free_list_head: u64, // Head of free record list
-    _reserved: [256 - 88]u8, // Reserved for future use (pad to 256 bytes)
+    _reserved: [256 - 104]u8, // Reserved for future use (pad to 256 bytes)
 
     pub fn init(key_count: u16, record_size: u32) FileHeader {
         return .{
@@ -167,19 +189,26 @@ pub const FileHeader = struct {
             .version = VERSION,
             .page_size = DEFAULT_PAGE_SIZE,
             .key_count = key_count,
-            .flags = 0,
+            .flags = .{},
             .record_count = 0,
             .record_size = record_size,
             .record_type = .fixed,
             ._padding1 = [_]u8{0} ** 3,
             .key_defs_offset = HEADER_SIZE,
             .key_defs_size = 0,
+            .schema_offset = 0,
+            .schema_size = 0,
             .index_offset = 0,
             .index_size = 0,
             .data_offset = 0,
             .free_list_head = 0,
-            ._reserved = [_]u8{0} ** (256 - 88),
+            ._reserved = [_]u8{0} ** (256 - 104),
         };
+    }
+
+    /// Check if this file has an embedded schema
+    pub fn hasSchema(self: FileHeader) bool {
+        return self.flags.has_schema and self.schema_size > 0;
     }
 };
 
@@ -208,11 +237,14 @@ pub const IsamFile = struct {
     allocator: std.mem.Allocator,
     file: ?std.fs.File, // Single database file
     header: FileHeader, // File header
+    schema: ?*Schema, // Optional embedded schema (for .NET interop)
+    owns_schema: bool, // True if we loaded schema from file (should free on close)
     key_defs: []KeyDef,
     btrees: []btree.BTree, // One B-tree per key definition
     current_key: u8,
     current_rfa: ?RFA,
     current_ulid: ?ULID, // ULID of the current record (database-managed, not part of user data)
+    current_table: ?*const TableDef, // Current table (for multi-table files)
     current_node: ?*btree.Node, // Current position in B-tree for sequential access
     current_position: usize, // Position within current node
     is_locked: bool,
@@ -229,8 +261,6 @@ pub const IsamFile = struct {
         record_size: u32,
         options: CreateOptions,
     ) IsamError!*Self {
-        _ = options;
-
         const self = allocator.create(Self) catch return IsamError.OutOfMemory;
         errdefer allocator.destroy(self);
 
@@ -264,20 +294,27 @@ pub const IsamFile = struct {
         // Calculate initial layout:
         // - Header at offset 0 (256 bytes)
         // - Key definitions follow header
-        // - Index region starts after key defs (will grow as we add data)
+        // - Schema region (if provided)
+        // - Index region starts after schema (will grow as we add data)
         // - Data region starts after a reserved index area
         const key_defs_size = self.calculateKeyDefsSize(owned_key_defs);
-        const initial_data_offset = HEADER_SIZE + key_defs_size + DEFAULT_PAGE_SIZE; // Reserve 1 page for index
+        const schema_size: u64 = if (options.schema) |s| s.serializedSize() else 0;
+        const schema_offset: u64 = if (schema_size > 0) HEADER_SIZE + key_defs_size else 0;
+        const index_offset = HEADER_SIZE + key_defs_size + schema_size;
+        const initial_data_offset = index_offset + DEFAULT_PAGE_SIZE; // Reserve 1 page for index
 
         self.* = .{
             .allocator = allocator,
             .file = file,
             .header = FileHeader.init(@intCast(key_defs.len), record_size),
+            .schema = options.schema,
+            .owns_schema = false, // Caller owns the schema
             .key_defs = owned_key_defs,
             .btrees = btrees,
             .current_key = 0,
             .current_rfa = null,
             .current_ulid = null,
+            .current_table = null,
             .current_node = null,
             .current_position = 0,
             .is_locked = false,
@@ -287,12 +324,23 @@ pub const IsamFile = struct {
 
         // Update header with calculated offsets
         self.header.key_defs_size = key_defs_size;
-        self.header.index_offset = HEADER_SIZE + key_defs_size;
+        self.header.schema_offset = schema_offset;
+        self.header.schema_size = schema_size;
+        self.header.index_offset = index_offset;
         self.header.data_offset = initial_data_offset;
+
+        // Set schema flags
+        if (options.schema) |s| {
+            self.header.flags.has_schema = true;
+            self.header.flags.multi_table = s.isMultiTable();
+        }
 
         // Write initial file structure
         try self.writeHeader();
         try self.writeKeyDefs();
+        if (options.schema != null) {
+            try self.writeSchema();
+        }
 
         return self;
     }
@@ -300,6 +348,7 @@ pub const IsamFile = struct {
     pub const CreateOptions = struct {
         page_size: u32 = DEFAULT_PAGE_SIZE,
         record_type: RecordType = .fixed,
+        schema: ?*Schema = null, // Optional embedded schema for .NET interop
     };
 
     /// Calculate the size needed to store key definitions
@@ -402,6 +451,70 @@ pub const IsamFile = struct {
         }
     }
 
+    /// Write schema to file
+    fn writeSchema(self: *Self) IsamError!void {
+        const file = self.file orelse return IsamError.IoError;
+        const s = self.schema orelse return;
+
+        file.seekTo(self.header.schema_offset) catch return IsamError.IoError;
+
+        // Serialize to a buffer first
+        const size = s.serializedSize();
+        const buffer = self.allocator.alloc(u8, size) catch return IsamError.OutOfMemory;
+        defer self.allocator.free(buffer);
+
+        var stream = std.io.fixedBufferStream(buffer);
+        s.serialize(stream.writer()) catch return IsamError.IoError;
+
+        // Write buffer to file
+        _ = file.write(buffer) catch return IsamError.IoError;
+    }
+
+    /// Read schema from file
+    fn readSchema(self: *Self) IsamError!void {
+        const file = self.file orelse return IsamError.IoError;
+
+        if (self.header.schema_size == 0) return;
+
+        file.seekTo(self.header.schema_offset) catch return IsamError.IoError;
+
+        // Read into buffer
+        const buffer = self.allocator.alloc(u8, self.header.schema_size) catch return IsamError.OutOfMemory;
+        defer self.allocator.free(buffer);
+
+        _ = file.readAll(buffer) catch return IsamError.IoError;
+
+        // Deserialize from buffer
+        var stream = std.io.fixedBufferStream(buffer);
+        self.schema = Schema.deserialize(stream.reader(), self.allocator) catch return IsamError.IoError;
+    }
+
+    /// Get the embedded schema (if any)
+    pub fn getSchema(self: *Self) ?*Schema {
+        return self.schema;
+    }
+
+    /// Get table definition by tag byte (for multi-table files)
+    pub fn getTableByTag(self: *Self, tag: u8) ?*const TableDef {
+        if (self.schema) |s| {
+            return s.getTableByTag(tag);
+        }
+        return null;
+    }
+
+    /// Get the default table definition
+    pub fn getDefaultTable(self: *Self) ?*const TableDef {
+        if (self.schema) |s| {
+            return s.getDefaultTable();
+        }
+        return null;
+    }
+
+    /// Set the current table for multi-table operations
+    pub fn setCurrentTable(self: *Self, table: *const TableDef) void {
+        self.current_table = table;
+    }
+
     /// Open an existing ISAM file (.zdb)
     pub fn open(
         allocator: std.mem.Allocator,
@@ -447,11 +560,14 @@ pub const IsamFile = struct {
             .allocator = allocator,
             .file = file,
             .header = header,
+            .schema = null,
+            .owns_schema = false,
             .key_defs = &[_]KeyDef{},
             .btrees = btrees,
             .current_key = 0,
             .current_rfa = null,
             .current_ulid = null,
+            .current_table = null,
             .current_node = null,
             .current_position = 0,
             .is_locked = false,
@@ -461,6 +577,12 @@ pub const IsamFile = struct {
 
         // Read key definitions from file
         try self.readKeyDefs();
+
+        // Read schema if present
+        if (header.hasSchema()) {
+            try self.readSchema();
+            self.owns_schema = true; // We loaded it, we own it
+        }
 
         // Load B-tree from index file
         try self.deserializeIndex();
@@ -504,6 +626,14 @@ pub const IsamFile = struct {
             }
             self.allocator.free(self.key_defs);
         }
+
+        // Clean up schema if we own it (loaded from file)
+        if (self.owns_schema) {
+            if (self.schema) |s| {
+                s.deinit(self.allocator);
+            }
+        }
+
         self.allocator.destroy(self);
     }
 
@@ -1273,4 +1403,105 @@ test "isam ULID record identifier" {
 
     // Clean up test file
     std.fs.cwd().deleteFile("/tmp/test_ulid.zdb") catch {};
+}
+
+test "isam with embedded schema" {
+    const allocator = std.testing.allocator;
+
+    // Build a schema for multi-table order file
+    var header_builder = TableBuilder.init(allocator, "order_header");
+    _ = header_builder.setTag('H');
+    _ = header_builder.setDefault();
+    _ = try header_builder.addField("tag", .alpha, 0, 1);
+    _ = try header_builder.addField("order_id", .alpha, 1, 8);
+    _ = try header_builder.addField("customer", .alpha, 9, 8);
+    _ = try header_builder.addDecimalField("total", 17, 10, 2);
+    const header_table = try header_builder.build();
+
+    var detail_builder = TableBuilder.init(allocator, "order_detail");
+    _ = detail_builder.setTag('D');
+    _ = try detail_builder.addField("tag", .alpha, 0, 1);
+    _ = try detail_builder.addField("order_id", .alpha, 1, 8);
+    _ = try detail_builder.addField("product", .alpha, 9, 10);
+    _ = try detail_builder.addDecimalField("qty", 19, 6, 0);
+    const detail_table = try detail_builder.build();
+
+    var schema_builder = SchemaBuilder.init(allocator);
+    _ = schema_builder.setDescription("Order management");
+    _ = schema_builder.setTagPosition(0);
+    _ = try schema_builder.addTable(header_table);
+    _ = try schema_builder.addTable(detail_table);
+    const schema = try schema_builder.build();
+
+    // Create ISAM file with schema
+    const key_segments = [_]KeyDef.KeySegment{
+        .{ .start = 1, .length = 8, .key_type = .alpha }, // order_id at position 1
+    };
+    const key_defs = [_]KeyDef{
+        .{
+            .segments = &key_segments,
+            .allow_duplicates = true, // Allow multiple records per order
+            .changes_allowed = false,
+            .key_number = 0,
+        },
+    };
+
+    {
+        const isam_file = try IsamFile.create(
+            allocator,
+            "/tmp/test_schema",
+            &key_defs,
+            32, // record size
+            .{ .schema = schema },
+        );
+
+        // Verify schema is attached
+        try std.testing.expect(isam_file.header.flags.has_schema);
+        try std.testing.expect(isam_file.header.flags.multi_table);
+        try std.testing.expect(isam_file.schema != null);
+        try std.testing.expectEqual(@as(usize, 2), isam_file.schema.?.tables.len);
+
+        // Store some records
+        const header_rec = "HORD00001CUST0001" ++ "0000015000"; // tag + order_id + customer + total
+        const detail_rec = "DORD00001PROD00001" ++ "000010"; // tag + order_id + product + qty
+
+        _ = try isam_file.store(header_rec);
+        _ = try isam_file.store(detail_rec);
+
+        isam_file.close();
+    }
+
+    // Caller owns the schema passed to create(), so we must free it
+    schema.deinit(allocator);
+
+    // Reopen and verify schema persisted
+    {
+        const isam_file = try IsamFile.open(allocator, "/tmp/test_schema", .read_write);
+        defer isam_file.close();
+
+        // Schema should be loaded
+        try std.testing.expect(isam_file.schema != null);
+        const loaded_schema = isam_file.schema.?;
+
+        try std.testing.expectEqualStrings("Order management", loaded_schema.description);
+        try std.testing.expectEqual(@as(u32, 0), loaded_schema.tag_position);
+        try std.testing.expectEqual(@as(usize, 2), loaded_schema.tables.len);
+
+        // Check tables
+        const h = loaded_schema.getTableByTag('H');
+        try std.testing.expect(h != null);
+        try std.testing.expectEqualStrings("order_header", h.?.name);
+
+        const d = loaded_schema.getTableByTag('D');
+        try std.testing.expect(d != null);
+        try std.testing.expectEqualStrings("order_detail", d.?.name);
+
+        // Verify data still readable
+        var buf: [32]u8 = undefined;
+        _ = try isam_file.read("ORD00001", &buf, .{ .match_mode = .exact });
+        try std.testing.expectEqual(@as(u8, 'H'), buf[0]); // First record is header
+    }
+
+    // Clean up
+    std.fs.cwd().deleteFile("/tmp/test_schema.zdb") catch {};
 }

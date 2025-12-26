@@ -1,6 +1,6 @@
-//! Ziggy DBL Runtime
+//! Zibol Runtime
 //!
-//! Executes DBL programs by walking the AST.
+//! Executes Zibol programs by walking the AST.
 
 const std = @import("std");
 const ast = @import("../ast/ast.zig");

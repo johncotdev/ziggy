@@ -1,4 +1,4 @@
-//! Ziggy DBL Bytecode Disassembler
+//! Zibol Bytecode Disassembler
 //!
 //! Provides human-readable output of bytecode for debugging.
 
@@ -28,7 +28,7 @@ pub const Disassembler = struct {
 
     /// Disassemble entire module
     pub fn disassembleModule(self: *Self) !void {
-        try self.writer.print("; Ziggy DBL Bytecode Disassembly\n", .{});
+        try self.writer.print("; Zibol Bytecode Disassembly\n", .{});
         try self.writer.print("; Version: {}.{}\n", .{
             self.mod.header.version_major,
             self.mod.header.version_minor,

@@ -1,4 +1,4 @@
-//! Ziggy DBL Module Linker
+//! Zibol Module Linker
 //!
 //! Loads compiled bytecode modules (.zbc files) and links their
 //! exported subroutines into the runtime environment.

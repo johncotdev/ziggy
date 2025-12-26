@@ -1,7 +1,7 @@
-//! Ziggy DBL Subroutine Registry
+//! Zibol Subroutine Registry
 //!
-//! Unified dispatch for XCALL subroutines - both native (Zig) and DBL (bytecode).
-//! This is the central registry for all callable subroutines in Ziggy DBL.
+//! Unified dispatch for XCALL subroutines - both native (Zig) and Zibol (bytecode).
+//! This is the central registry for all callable subroutines in Zibol.
 
 const std = @import("std");
 const bytecode = @import("../bytecode/bytecode.zig");
@@ -60,7 +60,7 @@ pub const NativeSubroutineFn = *const fn (*SubroutineContext) SubroutineError!?V
 /// Subroutine types
 pub const SubroutineType = enum {
     native,     // Implemented in Zig
-    bytecode,   // Compiled DBL (from loaded module)
+    bytecode,   // Compiled Zibol (from loaded module)
 };
 
 /// Subroutine definition
