@@ -353,6 +353,27 @@ pub const Module = struct {
             try constant.serialize(writer);
         }
 
+        // Write types section
+        try writer.writeInt(u32, @intCast(self.types.len), .little);
+        for (self.types) |type_def| {
+            try writer.writeInt(u16, type_def.type_id, .little);
+            try writer.writeByte(@intFromEnum(type_def.kind));
+            try writer.writeByte(type_def.flags);
+            try writer.writeInt(u16, type_def.name_index, .little);
+            try writer.writeInt(u32, type_def.total_size, .little);
+            // Write fields
+            try writer.writeInt(u16, @intCast(type_def.fields.len), .little);
+            for (type_def.fields) |field| {
+                try writer.writeInt(u16, field.name_index, .little);
+                try writer.writeByte(@intFromEnum(field.data_type));
+                try writer.writeByte(field.flags);
+                try writer.writeInt(u16, field.offset, .little);
+                try writer.writeInt(u16, field.size, .little);
+                try writer.writeByte(field.precision);
+                // Skip array_dims for now (could add later)
+            }
+        }
+
         // Write code section
         try writer.writeInt(u32, @intCast(self.code.len), .little);
         try writer.writeAll(self.code);
@@ -376,6 +397,36 @@ pub const Module = struct {
             module.constants = try allocator.alloc(Constant, const_count);
             for (0..const_count) |i| {
                 module.constants[i] = try Constant.deserialize(allocator, reader);
+            }
+        }
+
+        // Read types section
+        const type_count = try reader.readInt(u32, .little);
+        if (type_count > 0) {
+            module.types = try allocator.alloc(TypeDef, type_count);
+            for (0..type_count) |i| {
+                module.types[i].type_id = try reader.readInt(u16, .little);
+                module.types[i].kind = @enumFromInt(try reader.readByte());
+                module.types[i].flags = try reader.readByte();
+                module.types[i].name_index = try reader.readInt(u16, .little);
+                module.types[i].total_size = try reader.readInt(u32, .little);
+
+                // Read fields
+                const field_count = try reader.readInt(u16, .little);
+                if (field_count > 0) {
+                    module.types[i].fields = try allocator.alloc(FieldDef, field_count);
+                    for (0..field_count) |j| {
+                        module.types[i].fields[j].name_index = try reader.readInt(u16, .little);
+                        module.types[i].fields[j].data_type = @enumFromInt(try reader.readByte());
+                        module.types[i].fields[j].flags = try reader.readByte();
+                        module.types[i].fields[j].offset = try reader.readInt(u16, .little);
+                        module.types[i].fields[j].size = try reader.readInt(u16, .little);
+                        module.types[i].fields[j].precision = try reader.readByte();
+                        module.types[i].fields[j].array_dims = &[_]u16{};
+                    }
+                } else {
+                    module.types[i].fields = &[_]FieldDef{};
+                }
             }
         }
 

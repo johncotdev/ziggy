@@ -80,7 +80,10 @@ pub const Statement = union(enum) {
             .group => |g| allocator.free(g.fields),
             .display_stmt => |d| allocator.free(d.expressions),
             .xcall => |x| allocator.free(x.arguments),
-            .read_stmt => |r| if (r.qualifiers.len > 0) allocator.free(r.qualifiers),
+            .read_stmt => |r| {
+                if (r.qualifiers.len > 0) allocator.free(r.qualifiers);
+                if (r.error_list.len > 0) allocator.free(r.error_list);
+            },
             .write_stmt => |w| if (w.qualifiers.len > 0) allocator.free(w.qualifiers),
             .open_stmt => |o| if (o.qualifiers.len > 0) allocator.free(o.qualifiers),
             .store_stmt => |s| if (s.qualifiers.len > 0) allocator.free(s.qualifiers),
@@ -276,11 +279,18 @@ pub const CloseStatement = struct {
     channel: Expression,
 };
 
+/// Error handler for I/O statements [[eof=label, err=handler]]
+pub const ErrorHandler = struct {
+    error_type: []const u8, // "eof", "err", "locked", etc.
+    label: []const u8, // Jump target
+};
+
 pub const ReadStatement = struct {
     channel: Expression,
     record: Expression,
     key: ?Expression,
     qualifiers: []Qualifier,
+    error_list: []ErrorHandler,
 };
 
 pub const WriteStatement = struct {

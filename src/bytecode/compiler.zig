@@ -36,6 +36,12 @@ const VarInfo = struct {
     data_type: module.DataTypeCode,
 };
 
+/// Record type information
+const RecordInfo = struct {
+    type_index: u16,
+    total_size: u16,
+};
+
 /// Label for forward references
 const Label = struct {
     name: []const u8,
@@ -59,6 +65,7 @@ pub const Compiler = struct {
     locals: std.StringHashMap(VarInfo),
     local_count: u16,
     labels: std.StringHashMap(Label),
+    record_types: std.StringHashMap(RecordInfo),
 
     // Constant deduplication
     string_constants: std.StringHashMap(u16),
@@ -87,6 +94,7 @@ pub const Compiler = struct {
             .locals = std.StringHashMap(VarInfo).init(allocator),
             .local_count = 0,
             .labels = std.StringHashMap(Label).init(allocator),
+            .record_types = std.StringHashMap(RecordInfo).init(allocator),
             .string_constants = std.StringHashMap(u16).init(allocator),
             .int_constants = std.AutoHashMap(i64, u16).init(allocator),
             .max_stack = 0,
@@ -109,6 +117,7 @@ pub const Compiler = struct {
             label.references.deinit(self.allocator);
         }
         self.labels.deinit();
+        self.record_types.deinit();
         self.string_constants.deinit();
         self.int_constants.deinit();
         self.line_table.deinit(self.allocator);
@@ -208,14 +217,24 @@ pub const Compiler = struct {
             offset += size;
         }
 
+        const type_index: u16 = @intCast(self.types.items.len);
+
         try self.types.append(self.allocator, .{
-            .type_id = @intCast(self.types.items.len),
+            .type_id = type_index,
             .kind = .record,
             .flags = 0,
             .name_index = name_idx,
             .total_size = offset,
             .fields = try fields.toOwnedSlice(self.allocator),
         });
+
+        // Register named records for load_record_buf
+        if (record.name) |n| {
+            try self.record_types.put(n, .{
+                .type_index = type_index,
+                .total_size = offset,
+            });
+        }
     }
 
     // ========================================
@@ -536,15 +555,39 @@ pub const Compiler = struct {
     fn compileRead(self: *Self, read: *const ast.ReadStatement) CompileError!void {
         try self.compileExpression(&read.channel);
 
-        // For ISAM read with key
+        // Parse KEYNUM qualifier
+        // 255 = use channel's key_of_reference (SynergyDE behavior for READS)
+        // 0-254 = explicit key number
+        var key_num: u8 = 255; // Default: use channel's key_of_reference
+        var has_keynum = false;
+        for (read.qualifiers) |qual| {
+            if (std.ascii.eqlIgnoreCase(qual.name, "KEYNUM")) {
+                has_keynum = true;
+                if (qual.value) |val| {
+                    // Evaluate the key number expression
+                    switch (val) {
+                        .integer => |i| key_num = @intCast(i),
+                        else => {},
+                    }
+                }
+            }
+        }
+
+        // For ISAM read with key (keyed READ)
         if (read.key) |key| {
             try self.compileExpression(&key);
             try self.emit(.isam_read);
-            try self.emitU8(0); // key num
-            try self.emitU8(@intFromEnum(opcodes.MatchMode.exact));
+            // For keyed READ, use explicit key or 0 if not specified
+            try self.emitU8(if (has_keynum) key_num else 0);
+            // SynergyDE default match mode is Q_GEQ (greater_equal)
+            try self.emitU8(@intFromEnum(opcodes.MatchMode.greater_equal));
             self.popStack(1);
         } else {
-            try self.emit(.ch_read);
+            // Sequential read (READS)
+            // SynergyDE: READS uses channel's key_of_reference (set by prior READ/FIND)
+            // 255 = use channel's key_of_reference, otherwise use explicit KEYNUM
+            try self.emit(.ch_reads);
+            try self.emitU8(key_num);
         }
 
         // Store to record
@@ -818,6 +861,14 @@ pub const Compiler = struct {
     }
 
     fn emitLoadVar(self: *Self, name: []const u8) CompileError!void {
+        // Check if it's a record name - emit load_record_buf
+        if (self.record_types.get(name)) |record_info| {
+            try self.emit(.load_record_buf);
+            try self.emitU16(record_info.type_index);
+            self.pushStack(1);
+            return;
+        }
+
         // Check locals first
         if (self.locals.get(name)) |info| {
             switch (info.slot) {
@@ -855,6 +906,14 @@ pub const Compiler = struct {
     }
 
     fn emitStoreVar(self: *Self, name: []const u8) CompileError!void {
+        // Check if it's a record name - emit store_record_buf
+        if (self.record_types.get(name)) |record_info| {
+            try self.emit(.store_record_buf);
+            try self.emitU16(record_info.type_index);
+            self.popStack(1);
+            return;
+        }
+
         // Check locals first
         if (self.locals.get(name)) |info| {
             switch (info.slot) {

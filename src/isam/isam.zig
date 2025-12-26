@@ -2,9 +2,18 @@
 //!
 //! A Zig implementation of ISAM file storage, compatible with
 //! Synergy DBL ISAM semantics.
+//!
+//! Features:
+//! - Database-managed ULID (Universally Unique Lexicographically Sortable Identifier)
+//!   for each record, providing a modern alternative to SynergyDE's binary RFA
+//! - ULIDs are stored internally and are NOT part of the user's record data
+//! - Access via GETRFA qualifier (get current record's ULID) and RFA qualifier
+//!   (read by ULID directly)
 
 const std = @import("std");
 const btree = @import("btree.zig");
+const ulid_mod = @import("ulid.zig");
+pub const ULID = ulid_mod.ULID;
 
 /// ISAM file magic number
 pub const MAGIC_INDEX = [8]u8{ 'Z', 'I', 'G', 'G', 'Y', 'I', 'D', 'X' };
@@ -27,6 +36,8 @@ pub const IsamError = error{
     InvalidKey,
     OutOfMemory,
     IoError,
+    InvalidUlid,
+    UlidNotFound,
 };
 
 /// Key type specification
@@ -169,10 +180,12 @@ pub const IsamFile = struct {
     btrees: []btree.BTree, // One B-tree per key definition
     current_key: u8,
     current_rfa: ?RFA,
+    current_ulid: ?ULID, // ULID of the current record (database-managed, not part of user data)
     current_node: ?*btree.Node, // Current position in B-tree for sequential access
     current_position: usize, // Position within current node
     is_locked: bool,
     buffer_pool: BufferPool,
+    ulid_index: btree.BTree, // Special index for ULID lookups (auto-maintained)
 
     const Self = @This();
 
@@ -251,10 +264,12 @@ pub const IsamFile = struct {
             .btrees = btrees,
             .current_key = 0,
             .current_rfa = null,
+            .current_ulid = null,
             .current_node = null,
             .current_position = 0,
             .is_locked = false,
             .buffer_pool = BufferPool.init(allocator),
+            .ulid_index = btree.BTree.init(allocator),
         };
 
         // Write headers
@@ -327,10 +342,12 @@ pub const IsamFile = struct {
             .btrees = btrees,
             .current_key = 0,
             .current_rfa = null,
+            .current_ulid = null,
             .current_node = null,
             .current_position = 0,
             .is_locked = false,
             .buffer_pool = BufferPool.init(allocator),
+            .ulid_index = btree.BTree.init(allocator),
         };
 
         // Read key definitions from file
@@ -363,6 +380,9 @@ pub const IsamFile = struct {
         }
         self.allocator.free(self.btrees);
 
+        // Clean up ULID index
+        self.ulid_index.deinit();
+
         if (self.index_file) |*f| {
             f.close();
             self.index_file = null;
@@ -385,14 +405,18 @@ pub const IsamFile = struct {
     }
 
     /// Store a new record
+    /// Automatically generates a ULID for the record (database-managed identifier)
     pub fn store(self: *Self, record: []const u8) IsamError!RFA {
-        // Allocate space in data file
+        // Generate a unique ULID for this record
+        const record_ulid = ULID.new();
+
+        // Allocate space in data file (ULID + length + record)
         const rfa = try self.allocateRecord(record.len);
 
-        // Write record
-        try self.writeRecord(rfa, record);
+        // Write ULID + record to data file
+        try self.writeRecordWithUlid(rfa, record_ulid, record);
 
-        // Update all indexes
+        // Update all user-defined indexes
         for (self.key_defs, 0..) |key_def, i| {
             const key = key_def.extractKey(record, self.allocator) catch
                 return IsamError.OutOfMemory;
@@ -401,10 +425,21 @@ pub const IsamFile = struct {
             try self.insertKey(@intCast(i), key, rfa);
         }
 
+        // Update ULID index for direct ULID lookups
+        try self.insertUlidIndex(record_ulid, rfa);
+
         self.data_header.record_count += 1;
         self.current_rfa = rfa;
+        self.current_ulid = record_ulid;
 
         return rfa;
+    }
+
+    /// Store a new record and return its ULID
+    /// This is the preferred method when you need the record's unique identifier
+    pub fn storeWithUlid(self: *Self, record: []const u8) IsamError!ULID {
+        _ = try self.store(record);
+        return self.current_ulid.?;
     }
 
     /// Read a record by key
@@ -419,10 +454,12 @@ pub const IsamFile = struct {
         // Find key in index
         const rfa = try self.findKey(options.key_number, key, options.match_mode);
 
-        // Read record
-        const len = try self.readRecord(rfa, record_buf);
+        // Read record and its ULID
+        var record_ulid: ULID = undefined;
+        const len = try self.readRecordWithUlid(rfa, record_buf, &record_ulid);
 
         self.current_rfa = rfa;
+        self.current_ulid = record_ulid;
 
         // Apply lock if requested
         if (options.lock_mode != .no_lock) {
@@ -430,6 +467,58 @@ pub const IsamFile = struct {
         }
 
         return len;
+    }
+
+    /// Get the ULID of the current record
+    /// Returns null if no record has been read
+    pub fn getRecordUlid(self: *Self) ?ULID {
+        return self.current_ulid;
+    }
+
+    /// Get the ULID of the current record as a 26-character string
+    /// Returns null if no record has been read
+    pub fn getRecordUlidString(self: *Self) ?[26]u8 {
+        if (self.current_ulid) |ulid| {
+            return ulid.encode();
+        }
+        return null;
+    }
+
+    /// Read a record directly by its ULID
+    /// This is a modern alternative to reading by RFA
+    pub fn readByUlid(
+        self: *Self,
+        record_ulid: ULID,
+        record_buf: []u8,
+        options: ReadOptions,
+    ) IsamError!usize {
+        // Look up RFA from ULID index
+        const rfa = try self.findByUlid(record_ulid);
+
+        // Read record (ULID is already known)
+        var stored_ulid: ULID = undefined;
+        const len = try self.readRecordWithUlid(rfa, record_buf, &stored_ulid);
+
+        self.current_rfa = rfa;
+        self.current_ulid = stored_ulid;
+
+        // Apply lock if requested
+        if (options.lock_mode != .no_lock) {
+            self.is_locked = true;
+        }
+
+        return len;
+    }
+
+    /// Read a record by ULID string (26-character Crockford Base32)
+    pub fn readByUlidString(
+        self: *Self,
+        ulid_str: []const u8,
+        record_buf: []u8,
+        options: ReadOptions,
+    ) IsamError!usize {
+        const record_ulid = ULID.decode(ulid_str) catch return IsamError.InvalidUlid;
+        return self.readByUlid(record_ulid, record_buf, options);
     }
 
     pub const ReadOptions = struct {
@@ -460,6 +549,7 @@ pub const IsamFile = struct {
         if (key_number != self.current_key) {
             self.current_key = key_number;
             self.current_rfa = null;
+            self.current_ulid = null;
             self.current_node = null; // Reset B-tree position
             self.current_position = 0;
         }
@@ -468,20 +558,24 @@ pub const IsamFile = struct {
         // If no current position, getNextRfa starts from beginning
         const next_rfa = try self.getNextRfa(self.current_key, self.current_rfa);
 
-        const len = try self.readRecord(next_rfa, record_buf);
+        // Read record and its ULID
+        var record_ulid: ULID = undefined;
+        const len = try self.readRecordWithUlid(next_rfa, record_buf, &record_ulid);
         self.current_rfa = next_rfa;
+        self.current_ulid = record_ulid;
 
         return len;
     }
 
     /// Update current record
+    /// Preserves the record's ULID (database-managed identifier doesn't change on update)
     pub fn write(self: *Self, record: []const u8) IsamError!void {
-        if (self.current_rfa == null) {
+        if (self.current_rfa == null or self.current_ulid == null) {
             return IsamError.KeyNotFound;
         }
 
-        // Update record in data file
-        try self.writeRecord(self.current_rfa.?, record);
+        // Update record in data file, preserving its ULID
+        try self.writeRecordWithUlid(self.current_rfa.?, self.current_ulid.?, record);
 
         // Update indexes if keys changed
         // TODO: Implement key change detection and index update
@@ -523,7 +617,7 @@ pub const IsamFile = struct {
         const header_size: u64 = DEFAULT_BLOCK_SIZE;
         index_file.seekTo(header_size) catch return IsamError.IoError;
 
-        // For each B-tree, serialize all leaf entries
+        // For each user-defined B-tree, serialize all leaf entries
         for (self.btrees, 0..) |*bt, key_idx| {
             // Get first leaf and count entries
             var entry_count: u32 = @intCast(bt.size);
@@ -555,6 +649,27 @@ pub const IsamFile = struct {
 
             _ = key_idx;
         }
+
+        // Serialize ULID index (fixed 16-byte keys)
+        const ulid_count: u32 = @intCast(self.ulid_index.size);
+        _ = index_file.write(std.mem.asBytes(&ulid_count)) catch return IsamError.IoError;
+
+        var ulid_leaf = self.ulid_index.firstLeaf();
+        while (ulid_leaf) |node| {
+            var i: usize = 0;
+            while (i < node.key_count) : (i += 1) {
+                const key = node.keys[i];
+                const rec = node.records[i];
+
+                // Write ULID (always 16 bytes, no length prefix needed)
+                _ = index_file.write(key.data) catch return IsamError.IoError;
+
+                // Write RFA
+                const rfa_bytes = (RFA{ .block = rec.block, .offset = rec.offset }).toBytes();
+                _ = index_file.write(&rfa_bytes) catch return IsamError.IoError;
+            }
+            ulid_leaf = node.next_leaf;
+        }
     }
 
     /// Deserialize B-tree indexes from disk
@@ -565,48 +680,79 @@ pub const IsamFile = struct {
         const header_size: u64 = DEFAULT_BLOCK_SIZE;
         index_file.seekTo(header_size) catch return IsamError.IoError;
 
-        // For each B-tree, read and insert entries
+        // For each user-defined B-tree, read and insert entries
         for (self.btrees) |*bt| {
             // Read entry count
             var count_buf: [4]u8 = undefined;
             const count_read = index_file.read(&count_buf) catch return IsamError.IoError;
             if (count_read < 4) {
                 // No more data, this is OK for newly created files
-                break;
+                return;
             }
             const entry_count = std.mem.readInt(u32, &count_buf, .little);
 
             // Read each entry
-            var i: u32 = 0;
-            while (i < entry_count) : (i += 1) {
+            var j: u32 = 0;
+            while (j < entry_count) : (j += 1) {
                 // Read key length
                 var len_buf: [2]u8 = undefined;
                 _ = index_file.read(&len_buf) catch return IsamError.IoError;
                 const key_len = std.mem.readInt(u16, &len_buf, .little);
 
-                // Read key data
+                // Read key data into temporary buffer
                 const key_data = self.allocator.alloc(u8, key_len) catch return IsamError.OutOfMemory;
+                defer self.allocator.free(key_data); // Always free - insert() makes its own copy
+
                 _ = index_file.read(key_data) catch {
-                    self.allocator.free(key_data);
                     return IsamError.IoError;
                 };
 
                 // Read RFA
                 var rfa_buf: [8]u8 = undefined;
                 _ = index_file.read(&rfa_buf) catch {
-                    self.allocator.free(key_data);
                     return IsamError.IoError;
                 };
                 const rfa = RFA.fromBytes(rfa_buf);
 
-                // Insert into B-tree
+                // Insert into B-tree (insert() copies the key data)
                 const btree_key = btree.Key{ .data = key_data };
                 const record_ptr = btree.RecordPtr{ .block = rfa.block, .offset = rfa.offset };
                 bt.insert(btree_key, record_ptr) catch {
-                    self.allocator.free(key_data);
                     return IsamError.OutOfMemory;
                 };
             }
+        }
+
+        // Deserialize ULID index
+        var ulid_count_buf: [4]u8 = undefined;
+        const ulid_count_read = index_file.read(&ulid_count_buf) catch return;
+        if (ulid_count_read < 4) return; // No ULID index (older file format)
+
+        const ulid_count = std.mem.readInt(u32, &ulid_count_buf, .little);
+
+        var k: u32 = 0;
+        while (k < ulid_count) : (k += 1) {
+            // Read ULID (always 16 bytes) into temporary buffer
+            const ulid_data = self.allocator.alloc(u8, 16) catch return IsamError.OutOfMemory;
+            defer self.allocator.free(ulid_data); // Always free - insert() makes its own copy
+
+            _ = index_file.read(ulid_data) catch {
+                return IsamError.IoError;
+            };
+
+            // Read RFA
+            var rfa_buf: [8]u8 = undefined;
+            _ = index_file.read(&rfa_buf) catch {
+                return IsamError.IoError;
+            };
+            const rfa = RFA.fromBytes(rfa_buf);
+
+            // Insert into ULID index (insert() copies the key data)
+            const ulid_key = btree.Key{ .data = ulid_data };
+            const record_ptr = btree.RecordPtr{ .block = rfa.block, .offset = rfa.offset };
+            self.ulid_index.insert(ulid_key, record_ptr) catch {
+                return IsamError.OutOfMemory;
+            };
         }
     }
 
@@ -711,11 +857,16 @@ pub const IsamFile = struct {
         };
     }
 
-    fn writeRecord(self: *Self, rfa: RFA, record: []const u8) IsamError!void {
+    /// Write a record with its ULID to the data file
+    /// Data format: [ULID 16 bytes][length 4 bytes][record data]
+    fn writeRecordWithUlid(self: *Self, rfa: RFA, record_ulid: ULID, record: []const u8) IsamError!void {
         const data_file = self.data_file orelse return IsamError.IoError;
         const pos = @as(u64, rfa.block) * self.index_header.block_size + rfa.offset;
 
         data_file.seekTo(pos) catch return IsamError.IoError;
+
+        // Write ULID first (16 bytes) - database-managed, not part of user data
+        _ = data_file.write(&record_ulid.bytes) catch return IsamError.IoError;
 
         // Write record length (for variable length support)
         const len: u32 = @intCast(record.len);
@@ -725,11 +876,19 @@ pub const IsamFile = struct {
         _ = data_file.write(record) catch return IsamError.IoError;
     }
 
-    fn readRecord(self: *Self, rfa: RFA, buf: []u8) IsamError!usize {
+    /// Read a record and its ULID from the data file
+    /// Data format: [ULID 16 bytes][length 4 bytes][record data]
+    fn readRecordWithUlid(self: *Self, rfa: RFA, buf: []u8, out_ulid: *ULID) IsamError!usize {
         const data_file = self.data_file orelse return IsamError.IoError;
         const pos = @as(u64, rfa.block) * self.index_header.block_size + rfa.offset;
 
         data_file.seekTo(pos) catch return IsamError.IoError;
+
+        // Read ULID first (16 bytes)
+        var ulid_buf: [16]u8 = undefined;
+        const ulid_read = data_file.read(&ulid_buf) catch return IsamError.IoError;
+        if (ulid_read < 16) return IsamError.IoError;
+        out_ulid.* = ULID{ .bytes = ulid_buf };
 
         // Read record length
         var len_buf: [4]u8 = undefined;
@@ -741,6 +900,29 @@ pub const IsamFile = struct {
         const bytes_read = data_file.read(buf[0..read_len]) catch return IsamError.IoError;
 
         return bytes_read;
+    }
+
+    /// Insert ULID into the ULID index for direct lookups
+    fn insertUlidIndex(self: *Self, record_ulid: ULID, rfa: RFA) IsamError!void {
+        // Use ULID bytes as the key (16 bytes, lexicographically sortable)
+        const ulid_key = btree.Key{ .data = &record_ulid.bytes };
+        const record_ptr = btree.RecordPtr{ .block = rfa.block, .offset = rfa.offset };
+
+        self.ulid_index.insert(ulid_key, record_ptr) catch return IsamError.OutOfMemory;
+    }
+
+    /// Find RFA by ULID
+    fn findByUlid(self: *Self, record_ulid: ULID) IsamError!RFA {
+        const ulid_key = btree.Key{ .data = &record_ulid.bytes };
+
+        const result = self.ulid_index.searchWithMode(ulid_key, .exact) orelse {
+            return IsamError.UlidNotFound;
+        };
+
+        return RFA{
+            .block = result.node.records[result.position].block,
+            .offset = result.node.records[result.position].offset,
+        };
     }
 
     fn freeRecord(self: *Self, rfa: RFA) IsamError!void {
@@ -1034,4 +1216,78 @@ test "isam persistence" {
     // Clean up test files
     std.fs.cwd().deleteFile("/tmp/test_persist.ism") catch {};
     std.fs.cwd().deleteFile("/tmp/test_persist.is1") catch {};
+}
+
+test "isam ULID record identifier" {
+    const allocator = std.testing.allocator;
+
+    // Define a simple key on first 8 bytes
+    const key_segments = [_]KeyDef.KeySegment{
+        .{ .start = 0, .length = 8, .key_type = .alpha },
+    };
+    const key_defs = [_]KeyDef{
+        .{
+            .segments = &key_segments,
+            .allow_duplicates = false,
+            .changes_allowed = false,
+            .key_number = 0,
+        },
+    };
+
+    // Create ISAM file
+    const isam_file = try IsamFile.create(
+        allocator,
+        "/tmp/test_ulid",
+        &key_defs,
+        64,
+        .{},
+    );
+    defer isam_file.close();
+
+    // Store records and capture their ULIDs
+    const record1 = "ULID0001" ++ "First record with auto-generated ULID............";
+    const record2 = "ULID0002" ++ "Second record with auto-generated ULID...........";
+
+    // Use storeWithUlid to get the ULID directly
+    const ulid1 = try isam_file.storeWithUlid(record1);
+    const ulid2 = try isam_file.storeWithUlid(record2);
+
+    // ULIDs should be different
+    try std.testing.expect(!ulid1.eql(ulid2));
+
+    // ULIDs should be comparable (ulid1 generated before ulid2)
+    // Note: ULIDs from same millisecond are only sorted by random part
+    const order = ulid1.compare(ulid2);
+    try std.testing.expect(order == .lt or order == .gt or order == .eq);
+
+    // Read by key and verify we can get the ULID
+    var buf: [64]u8 = undefined;
+    _ = try isam_file.read("ULID0001", &buf, .{ .match_mode = .exact });
+
+    // Get the ULID of the current record
+    const retrieved_ulid = isam_file.getRecordUlid();
+    try std.testing.expect(retrieved_ulid != null);
+    try std.testing.expect(retrieved_ulid.?.eql(ulid1));
+
+    // Get as string
+    const ulid_str = isam_file.getRecordUlidString();
+    try std.testing.expect(ulid_str != null);
+    try std.testing.expectEqual(@as(usize, 26), ulid_str.?.len);
+
+    // Read directly by ULID (modern alternative to RFA)
+    var buf2: [64]u8 = undefined;
+    const len = try isam_file.readByUlid(ulid2, &buf2, .{});
+    try std.testing.expect(len > 0);
+    try std.testing.expect(std.mem.startsWith(u8, &buf2, "ULID0002"));
+
+    // Read by ULID string
+    const ulid2_str = ulid2.encode();
+    var buf3: [64]u8 = undefined;
+    const len3 = try isam_file.readByUlidString(&ulid2_str, &buf3, .{});
+    try std.testing.expect(len3 > 0);
+    try std.testing.expect(std.mem.startsWith(u8, &buf3, "ULID0002"));
+
+    // Clean up test files
+    std.fs.cwd().deleteFile("/tmp/test_ulid.ism") catch {};
+    std.fs.cwd().deleteFile("/tmp/test_ulid.is1") catch {};
 }

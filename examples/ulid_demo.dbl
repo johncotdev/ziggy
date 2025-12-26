@@ -1,0 +1,129 @@
+; ulid_demo.dbl - ULID Record Identifier Demo for Ziggy DBL
+;
+; Demonstrates Ziggy's modern ULID-based record identifiers:
+; - Database-managed ULIDs (not part of user's record data)
+; - GETRFA qualifier to retrieve a record's ULID
+; - RFA qualifier to read directly by ULID
+; - 26-character human-readable, sortable identifiers
+;
+; ULIDs are a modern alternative to SynergyDE's binary RFA:
+; - Globally unique across time and space
+; - Lexicographically sortable by creation time
+; - Human-readable (Crockford Base32)
+; - URL-safe characters
+
+record product
+    sku         ,a10    ; Product SKU (primary key)
+    name        ,a30    ; Product name
+    price       ,d8     ; Price in cents
+    stock       ,i4     ; Quantity in stock
+endrecord
+
+record
+    tt          ,i4     ; Terminal channel
+    ch          ,i4     ; ISAM file channel
+    ulid1       ,a26    ; ULID for product 1
+    ulid2       ,a26    ; ULID for product 2
+    ulid3       ,a26    ; ULID for product 3
+    current_ulid ,a26   ; Current ULID from read operations
+endrecord
+
+proc
+    ; Open terminal
+    open(tt, "O", "tt:")
+
+    display(tt, "=== Ziggy ULID Record Identifier Demo ===")
+    display(tt, "")
+    display(tt, "ULIDs are 26-character, human-readable,")
+    display(tt, "lexicographically sortable unique identifiers.")
+    display(tt, "")
+
+    ; Create ISAM file with single key on SKU
+    xcall ISAMC("products", 52, 1, "START=1, LENGTH=10, TYPE=ALPHA")
+    display(tt, "Created ISAM file: products")
+    display(tt, "")
+
+    ; Open ISAM file
+    open(ch, "U:I", "products")
+    display(tt, "Opened ISAM file: products")
+    display(tt, "")
+
+    ; Store products using GETRFA to get the ULID
+    display(tt, "--- Storing products with GETRFA ---")
+    display(tt, "")
+
+    ; Product 1 - save ULID in ulid1 for later RFA lookup
+    sku = "SKU-000001"
+    name = "Widget Pro"
+    price = 2999
+    stock = 150
+    store(ch, product, GETRFA:ulid1)
+    display(tt, "Stored: ", sku, " - ", name)
+    display(tt, "  ULID: ", ulid1)
+
+    ; Product 2
+    sku = "SKU-000002"
+    name = "Gadget Plus"
+    price = 4999
+    stock = 75
+    store(ch, product, GETRFA:ulid2)
+    display(tt, "Stored: ", sku, " - ", name)
+    display(tt, "  ULID: ", ulid2)
+
+    ; Product 3
+    sku = "SKU-000003"
+    name = "Doohickey Max"
+    price = 1999
+    stock = 200
+    store(ch, product, GETRFA:ulid3)
+    display(tt, "Stored: ", sku, " - ", name)
+    display(tt, "  ULID: ", ulid3)
+
+    display(tt, "")
+    display(tt, "--- Reading by Key (traditional) ---")
+    display(tt, "")
+
+    ; Read by SKU key
+    read(ch, product, "SKU-000002", GETRFA:current_ulid)
+    display(tt, "Read by key: ", sku, " - ", name)
+    display(tt, "  ULID: ", current_ulid)
+
+    display(tt, "")
+    display(tt, "--- Reading by ULID (modern RFA) ---")
+    display(tt, "")
+
+    ; Read directly by ULID (modern alternative to RFA)
+    ; Using the saved ULID from the first product (ulid1)
+    display(tt, "Looking up ULID: ", ulid1)
+    read(ch, product, ulid1, RFA, GETRFA:current_ulid)
+    display(tt, "Found: ", sku, " - ", name, " $", price)
+    display(tt, "  Verified ULID: ", current_ulid)
+
+    display(tt, "")
+    display(tt, "--- Sequential read with GETRFA ---")
+    display(tt, "")
+
+    ; Sequential read showing ULID for each record
+    read(ch, product, "SKU-000001", GETRFA:current_ulid)
+    display(tt, sku, " | ", name, " | ULID: ", current_ulid)
+
+    reads(ch, product, GETRFA:current_ulid)
+    display(tt, sku, " | ", name, " | ULID: ", current_ulid)
+
+    reads(ch, product, GETRFA:current_ulid)
+    display(tt, sku, " | ", name, " | ULID: ", current_ulid)
+
+    ; Close
+    close(ch)
+    display(tt, "")
+    display(tt, "=== Demo Complete ===")
+    display(tt, "")
+    display(tt, "Key Benefits of ULIDs over SynergyDE RFA:")
+    display(tt, "- Human readable (26 chars vs binary)")
+    display(tt, "- Time-sortable (earlier records sort first)")
+    display(tt, "- Can be stored in ,a26 fields")
+    display(tt, "- URL-safe for web applications")
+    display(tt, "- Globally unique across systems")
+    close(tt)
+
+end

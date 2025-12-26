@@ -4,8 +4,11 @@
 
 const std = @import("std");
 const Opcode = @import("opcodes.zig").Opcode;
+const opcodes = @import("opcodes.zig");
 const Module = @import("module.zig").Module;
 const Constant = @import("module.zig").Constant;
+const isam = @import("../isam/isam.zig");
+const subroutines = @import("../subroutines/subroutines.zig");
 
 /// Maximum stack size
 const STACK_SIZE = 4096;
@@ -132,9 +135,11 @@ pub const CallStack = struct {
 /// Channel state
 pub const Channel = struct {
     file: ?std.fs.File,
-    isam: ?*anyopaque, // IsamFile pointer
+    isam_file: ?*isam.IsamFile,
     is_terminal: bool,
     is_open: bool,
+    filename: ?[]const u8,
+    key_of_reference: u8, // Current key index for READS (set by READ/FIND)
 };
 
 /// Virtual Machine
@@ -149,6 +154,7 @@ pub const VM = struct {
     // Memory
     stack: [STACK_SIZE]Value,
     globals: std.ArrayList(Value),
+    global_buffers: std.ArrayList([]u8), // For alpha/string globals
     heap: std.heap.ArenaAllocator,
 
     // Call stack
@@ -157,6 +163,10 @@ pub const VM = struct {
     // I/O
     channels: [MAX_CHANNELS]Channel,
     stdout: std.fs.File,
+
+    // Subroutines
+    subroutine_registry: subroutines.SubroutineRegistry,
+    channel_manager: subroutines.ChannelManager,
 
     // Modules
     current_module: ?*const Module,
@@ -169,9 +179,11 @@ pub const VM = struct {
         for (&channels) |*ch| {
             ch.* = .{
                 .file = null,
-                .isam = null,
+                .isam_file = null,
                 .is_terminal = false,
                 .is_open = false,
+                .filename = null,
+                .key_of_reference = 0, // Default to primary key
             };
         }
 
@@ -182,10 +194,13 @@ pub const VM = struct {
             .fp = 0,
             .stack = undefined,
             .globals = .{},
+            .global_buffers = .{},
             .heap = std.heap.ArenaAllocator.init(allocator),
             .call_stack = .{},
             .channels = channels,
             .stdout = std.fs.File.stdout(),
+            .subroutine_registry = subroutines.SubroutineRegistry.init(allocator),
+            .channel_manager = subroutines.ChannelManager.init(allocator),
             .current_module = null,
             .modules = .{},
         };
@@ -195,11 +210,20 @@ pub const VM = struct {
         // Close channels
         for (&self.channels) |*ch| {
             if (ch.file) |*f| f.close();
+            if (ch.isam_file) |isam_f| isam_f.close();
         }
+
+        // Free global buffers
+        for (self.global_buffers.items) |buf| {
+            self.allocator.free(buf);
+        }
+        self.global_buffers.deinit(self.allocator);
 
         self.globals.deinit(self.allocator);
         self.heap.deinit();
         self.modules.deinit(self.allocator);
+        self.subroutine_registry.deinit();
+        self.channel_manager.deinit();
     }
 
     /// Load a module
@@ -490,6 +514,65 @@ pub const VM = struct {
                     try self.executeClose();
                 },
 
+                // Load record buffer (build from field globals)
+                .load_record_buf => {
+                    const type_idx = self.readU16(module);
+                    try self.executeLoadRecordBuf(module, type_idx);
+                },
+
+                // Store record buffer (distribute to field globals)
+                .store_record_buf => {
+                    const type_idx = self.readU16(module);
+                    try self.executeStoreRecordBuf(module, type_idx);
+                },
+
+                // XCALL - External subroutine call
+                .xcall => {
+                    const name_idx = self.readU16(module);
+                    const arg_count = module.code[self.ip];
+                    self.ip += 1;
+                    try self.executeXcall(module, name_idx, arg_count);
+                },
+
+                // ISAM Store
+                .isam_store => {
+                    try self.executeIsamStore();
+                },
+
+                // Keyed read (READ with key) - sets key of reference
+                .isam_read => {
+                    const key_num = module.code[self.ip];
+                    self.ip += 1;
+                    const match_mode = module.code[self.ip];
+                    self.ip += 1;
+                    try self.executeIsamRead(key_num, match_mode);
+                },
+
+                // Sequential read (ch_read has no key param, ch_reads has key param)
+                // SynergyDE: READS uses channel's key_of_reference (set by READ/FIND)
+                .ch_read => {
+                    // Use channel's key of reference
+                    try self.executeReads(255); // 255 = use channel's key_of_reference
+                },
+                .ch_reads => {
+                    // Backward compat: if KEYNUM specified, use it; otherwise use channel's
+                    const key_num = module.code[self.ip];
+                    self.ip += 1;
+                    try self.executeReads(key_num);
+                },
+                .isam_reads => {
+                    // Use channel's key of reference
+                    try self.executeReads(255);
+                },
+
+                // String concatenation
+                .str_concat => {
+                    const b = try self.pop();
+                    const a = try self.pop();
+                    const result = try self.concatValues(a, b);
+                    try self.push(result);
+                },
+
                 // Halt
                 .halt => return,
 
@@ -622,12 +705,46 @@ pub const VM = struct {
     }
 
     fn executeOpen(self: *Self, flags: u8) VMError!void {
-        _ = flags; // Mode is encoded in flags, not on stack
-        _ = try self.pop(); // filename
-        const channel = (try self.pop()).toInt();
+        const mode_flags: opcodes.OpenModeFlags = @bitCast(flags);
+        const filename_val = try self.pop();
+        const channel_val = try self.pop();
+        const channel_num = channel_val.toInt();
 
-        if (channel >= 0 and channel < MAX_CHANNELS) {
-            self.channels[@intCast(channel)].is_open = true;
+        if (channel_num < 0 or channel_num >= MAX_CHANNELS) {
+            return VMError.FileError;
+        }
+
+        const ch = &self.channels[@intCast(channel_num)];
+
+        // Get filename string
+        const filename = switch (filename_val) {
+            .string => |s| s,
+            .alpha => |a| std.mem.trim(u8, a, " "),
+            else => return VMError.InvalidType,
+        };
+
+        // Check for terminal
+        if (std.mem.eql(u8, filename, "tt:") or std.mem.eql(u8, filename, "TT:")) {
+            ch.is_terminal = true;
+            ch.is_open = true;
+            return;
+        }
+
+        // ISAM file open
+        if (mode_flags.isam) {
+            const isam_file = isam.IsamFile.open(self.allocator, filename, .read_write) catch {
+                return VMError.FileError;
+            };
+            ch.isam_file = isam_file;
+            ch.is_open = true;
+            ch.filename = filename;
+        } else {
+            // Regular file open
+            const file = std.fs.cwd().openFile(filename, .{ .mode = .read_write }) catch {
+                return VMError.FileError;
+            };
+            ch.file = file;
+            ch.is_open = true;
         }
     }
 
@@ -640,8 +757,351 @@ pub const VM = struct {
                 f.close();
                 ch.file = null;
             }
+            if (ch.isam_file) |isam_f| {
+                isam_f.close();
+                ch.isam_file = null;
+            }
             ch.is_open = false;
         }
+    }
+
+    fn executeLoadRecordBuf(self: *Self, module: *const Module, type_idx: u16) VMError!void {
+        // Get the type definition
+        if (type_idx >= module.types.len) {
+            return VMError.InvalidType;
+        }
+
+        const type_def = &module.types[type_idx];
+
+        // Allocate buffer for record
+        const buf = self.allocator.alloc(u8, type_def.total_size) catch return VMError.OutOfMemory;
+        @memset(buf, ' '); // Initialize with spaces
+        try self.global_buffers.append(self.allocator, buf);
+
+        // Calculate the global base offset for this record type
+        // Globals are created in order of record definition, then field order within each record
+        var global_base: u16 = 0;
+        for (module.types[0..type_idx]) |t| {
+            global_base += @intCast(t.fields.len);
+        }
+
+        // Fill buffer from field globals
+        for (type_def.fields, 0..) |field, field_idx| {
+            const global_slot = global_base + @as(u16, @intCast(field_idx));
+
+            if (global_slot < self.globals.items.len) {
+                const val = self.globals.items[global_slot];
+                const offset = field.offset;
+                const end = @min(offset + field.size, type_def.total_size);
+
+                // Copy value into buffer at field offset
+                switch (val) {
+                    .alpha => |a| {
+                        const copy_len = @min(a.len, end - offset);
+                        @memcpy(buf[offset .. offset + copy_len], a[0..copy_len]);
+                    },
+                    .string => |s| {
+                        const copy_len = @min(s.len, end - offset);
+                        @memcpy(buf[offset .. offset + copy_len], s[0..copy_len]);
+                    },
+                    .integer => |i| {
+                        // Format integer into buffer
+                        var tmp: [32]u8 = undefined;
+                        const str = std.fmt.bufPrint(&tmp, "{d}", .{i}) catch continue;
+                        // Right-align in field, pad with spaces on left for numeric
+                        if (str.len <= field.size) {
+                            const start = offset + field.size - str.len;
+                            @memcpy(buf[start .. start + str.len], str);
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        try self.push(.{ .alpha = buf });
+    }
+
+    fn executeStoreRecordBuf(self: *Self, module: *const Module, type_idx: u16) VMError!void {
+        // Pop the record buffer from stack
+        const record_val = try self.pop();
+        const buf = switch (record_val) {
+            .alpha => |a| a,
+            .string => |s| s,
+            else => return VMError.InvalidType,
+        };
+
+        // Get the type definition
+        if (type_idx >= module.types.len) {
+            return VMError.InvalidType;
+        }
+
+        const type_def = &module.types[type_idx];
+
+        // Calculate the global base offset for this record type
+        var global_base: u16 = 0;
+        for (module.types[0..type_idx]) |t| {
+            global_base += @intCast(t.fields.len);
+        }
+
+        // Distribute buffer data to field globals
+        for (type_def.fields, 0..) |field, field_idx| {
+            const global_slot = global_base + @as(u16, @intCast(field_idx));
+            const offset = field.offset;
+            const end = @min(offset + field.size, buf.len);
+
+            if (offset < buf.len) {
+                // Extract field data from buffer
+                const field_data = buf[offset..@min(end, buf.len)];
+
+                // Allocate copy for the field value
+                const field_copy = self.allocator.alloc(u8, field_data.len) catch return VMError.OutOfMemory;
+                @memcpy(field_copy, field_data);
+                try self.global_buffers.append(self.allocator, field_copy);
+
+                // Ensure globals array is big enough
+                while (self.globals.items.len <= global_slot) {
+                    try self.globals.append(self.allocator, .{ .null_val = {} });
+                }
+
+                // Store the field value
+                self.globals.items[global_slot] = .{ .alpha = field_copy };
+            }
+        }
+    }
+
+    fn executeXcall(self: *Self, module: *const Module, name_idx: u16, arg_count: u8) VMError!void {
+        // Get routine name from constants
+        const name_const = module.getConstant(name_idx) orelse return VMError.InvalidConstant;
+        const routine_name = switch (name_const) {
+            .identifier => |n| n,
+            .string => |s| s,
+            else => return VMError.InvalidConstant,
+        };
+
+        // Pop arguments in reverse order
+        var args: [16]subroutines.Value = undefined;
+        var i: usize = arg_count;
+        while (i > 0) {
+            i -= 1;
+            const val = try self.pop();
+            args[i] = self.valueToSubroutineValue(val);
+        }
+
+        // Create subroutine context
+        var ctx = subroutines.SubroutineContext{
+            .allocator = self.allocator,
+            .args = args[0..arg_count],
+            .channels = &self.channel_manager,
+        };
+
+        // Call the subroutine
+        const result = self.subroutine_registry.call(routine_name, &ctx) catch |err| {
+            std.debug.print("XCALL {s} failed: {}\n", .{ routine_name, err });
+            return VMError.InvalidOpcode;
+        };
+
+        // Push result if any
+        if (result) |res| {
+            try self.push(self.subroutineValueToValue(res));
+        }
+    }
+
+    fn valueToSubroutineValue(self: *Self, val: Value) subroutines.Value {
+        _ = self;
+        return switch (val) {
+            .null_val => .{ .null_val = {} },
+            .boolean => |b| .{ .integer = if (b) 1 else 0 },
+            .integer => |i| .{ .integer = i },
+            .decimal => |d| .{ .decimal = d.value }, // Runtime uses plain i64 for decimal
+            .alpha => |a| .{ .alpha = a },
+            .string => |s| .{ .string = s },
+            else => .{ .null_val = {} },
+        };
+    }
+
+    fn subroutineValueToValue(self: *Self, val: subroutines.Value) Value {
+        _ = self;
+        return switch (val) {
+            .null_val => .{ .null_val = {} },
+            .integer => |i| .{ .integer = i },
+            .decimal => |d| .{ .decimal = .{ .value = d, .precision = 0 } }, // Convert back
+            .alpha => |a| .{ .alpha = a },
+            .string => |s| .{ .string = s },
+            else => .{ .null_val = {} },
+        };
+    }
+
+    fn executeIsamStore(self: *Self) VMError!void {
+        const record_val = try self.pop();
+        const channel_val = try self.pop();
+        const channel_num = channel_val.toInt();
+
+        if (channel_num < 0 or channel_num >= MAX_CHANNELS) {
+            return VMError.FileError;
+        }
+
+        const ch = &self.channels[@intCast(channel_num)];
+        if (!ch.is_open) {
+            return VMError.FileError;
+        }
+
+        // Get record data
+        const record_data = switch (record_val) {
+            .alpha => |a| a,
+            .string => |s| @constCast(s),
+            else => return VMError.InvalidType,
+        };
+
+        // Store to ISAM file
+        if (ch.isam_file) |isam_f| {
+            _ = isam_f.store(record_data) catch return VMError.IsamError;
+        } else {
+            return VMError.FileError;
+        }
+    }
+
+    fn executeReads(self: *Self, key_num_param: u8) VMError!void {
+        const channel_val = try self.pop();
+        const channel_num = channel_val.toInt();
+
+        if (channel_num < 0 or channel_num >= MAX_CHANNELS) {
+            return VMError.FileError;
+        }
+
+        const ch = &self.channels[@intCast(channel_num)];
+        if (!ch.is_open) {
+            return VMError.FileError;
+        }
+
+        // Determine key number to use:
+        // - 255 means "use channel's key_of_reference" (SynergyDE behavior)
+        // - 0 could mean either "primary key" or "use channel's key_of_reference"
+        //   For backward compat, 0 means primary key unless it was set by a prior READ
+        // - Any other value is explicit KEYNUM (backward compat, non-standard)
+        var key_num: u8 = undefined;
+        if (key_num_param == 255) {
+            // Use channel's key of reference (SynergyDE behavior)
+            key_num = ch.key_of_reference;
+        } else {
+            // Explicit key number (backward compat for KEYNUM on READS)
+            key_num = key_num_param;
+            // Update channel's key of reference for consistency
+            ch.key_of_reference = key_num;
+        }
+
+        // Read next record from ISAM file using determined key
+        if (ch.isam_file) |isam_f| {
+            var record_buf: [4096]u8 = undefined;
+            const len = isam_f.readNextByKey(key_num, &record_buf) catch |err| {
+                if (err == isam.IsamError.EndOfFile) {
+                    return VMError.FileError; // EOF
+                }
+                return VMError.IsamError;
+            };
+
+            // Allocate buffer for the record
+            const result = self.allocator.alloc(u8, len) catch return VMError.OutOfMemory;
+            @memcpy(result, record_buf[0..len]);
+            try self.global_buffers.append(self.allocator, result);
+
+            try self.push(.{ .alpha = result });
+        } else {
+            return VMError.FileError;
+        }
+    }
+
+    fn executeIsamRead(self: *Self, key_num: u8, match_mode_byte: u8) VMError!void {
+        // Pop key value and channel
+        const key_val = try self.pop();
+        const channel_val = try self.pop();
+        const channel_num = channel_val.toInt();
+
+        if (channel_num < 0 or channel_num >= MAX_CHANNELS) {
+            return VMError.FileError;
+        }
+
+        const ch = &self.channels[@intCast(channel_num)];
+        if (!ch.is_open) {
+            return VMError.FileError;
+        }
+
+        // Set channel's key of reference (for subsequent READS)
+        ch.key_of_reference = key_num;
+
+        // Get key string
+        const key_str = switch (key_val) {
+            .alpha => |s| s,
+            .string => |s| @constCast(s),
+            .integer => |i| blk: {
+                const buf = self.allocator.alloc(u8, 32) catch return VMError.OutOfMemory;
+                const formatted = std.fmt.bufPrint(buf, "{d}", .{i}) catch return VMError.OutOfMemory;
+                try self.global_buffers.append(self.allocator, buf);
+                break :blk buf[0..formatted.len];
+            },
+            else => return VMError.InvalidType,
+        };
+
+        // Perform keyed read
+        if (ch.isam_file) |isam_f| {
+            var record_buf: [4096]u8 = undefined;
+
+            const match_mode: isam.MatchMode = @enumFromInt(match_mode_byte);
+            const len = isam_f.read(key_str, &record_buf, .{
+                .key_number = key_num,
+                .match_mode = match_mode,
+            }) catch |err| {
+                return switch (err) {
+                    isam.IsamError.KeyNotFound => VMError.FileError,
+                    isam.IsamError.EndOfFile => VMError.FileError,
+                    else => VMError.IsamError,
+                };
+            };
+
+            // Allocate buffer for the record
+            const result = self.allocator.alloc(u8, len) catch return VMError.OutOfMemory;
+            @memcpy(result, record_buf[0..len]);
+            try self.global_buffers.append(self.allocator, result);
+
+            try self.push(.{ .alpha = result });
+        } else {
+            return VMError.FileError;
+        }
+    }
+
+    fn concatValues(self: *Self, a: Value, b: Value) VMError!Value {
+        // Get string representations
+        const a_str = switch (a) {
+            .alpha => |s| s,
+            .string => |s| @constCast(s),
+            .integer => |i| blk: {
+                const buf = self.allocator.alloc(u8, 32) catch return VMError.OutOfMemory;
+                const len = std.fmt.bufPrint(buf, "{d}", .{i}) catch return VMError.OutOfMemory;
+                try self.global_buffers.append(self.allocator, buf);
+                break :blk buf[0..len.len];
+            },
+            else => return .{ .null_val = {} },
+        };
+
+        const b_str = switch (b) {
+            .alpha => |s| s,
+            .string => |s| @constCast(s),
+            .integer => |i| blk: {
+                const buf = self.allocator.alloc(u8, 32) catch return VMError.OutOfMemory;
+                const len = std.fmt.bufPrint(buf, "{d}", .{i}) catch return VMError.OutOfMemory;
+                try self.global_buffers.append(self.allocator, buf);
+                break :blk buf[0..len.len];
+            },
+            else => return .{ .null_val = {} },
+        };
+
+        // Concatenate
+        const result = self.allocator.alloc(u8, a_str.len + b_str.len) catch return VMError.OutOfMemory;
+        @memcpy(result[0..a_str.len], a_str);
+        @memcpy(result[a_str.len..], b_str);
+        try self.global_buffers.append(self.allocator, result);
+
+        return .{ .alpha = result };
     }
 };
 

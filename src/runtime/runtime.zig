@@ -97,6 +97,7 @@ pub const Channel = struct {
     current_record: ?[]u8,
     is_locked: bool,
     is_terminal: bool,
+    key_of_reference: u8, // Current key index for READS (set by READ/FIND)
 
     pub const FileMode = enum {
         closed,
@@ -135,6 +136,7 @@ pub const Runtime = struct {
                 .current_record = null,
                 .is_locked = false,
                 .is_terminal = false,
+                .key_of_reference = 0, // Default to primary key
             };
         }
 
@@ -611,6 +613,7 @@ pub const Runtime = struct {
                 .current_record = null,
                 .is_locked = false,
                 .is_terminal = true,
+                .key_of_reference = 0,
             };
             return;
         }
@@ -632,6 +635,7 @@ pub const Runtime = struct {
                 .current_record = null,
                 .is_locked = false,
                 .is_terminal = false,
+                .key_of_reference = 0,
             };
         } else {
             // Standard file I/O
@@ -651,6 +655,7 @@ pub const Runtime = struct {
                 .current_record = null,
                 .is_locked = false,
                 .is_terminal = false,
+                .key_of_reference = 0,
             };
         }
     }
@@ -699,8 +704,20 @@ pub const Runtime = struct {
         const record_data = try record_value.toString(self.allocator);
         defer self.allocator.free(record_data);
 
+        // Check for GETRFA qualifier (get the record's ULID into a variable)
+        var getrfa_var: ?[]const u8 = null;
+        for (store.qualifiers) |qual| {
+            if (std.ascii.eqlIgnoreCase(qual.name, "GETRFA")) {
+                if (qual.value) |v| {
+                    if (v == .identifier) {
+                        getrfa_var = v.identifier;
+                    }
+                }
+            }
+        }
+
         if (channel.isam_file) |isam_file| {
-            // ISAM store
+            // ISAM store - generates ULID automatically
             _ = isam_file.store(record_data) catch |err| {
                 return switch (err) {
                     isam.IsamError.DuplicateKey => RuntimeError.InvalidOperation,
@@ -708,6 +725,16 @@ pub const Runtime = struct {
                     else => RuntimeError.InvalidOperation,
                 };
             };
+
+            // If GETRFA was specified, store the ULID into the variable
+            if (getrfa_var) |var_name| {
+                if (isam_file.getRecordUlidString()) |ulid_str| {
+                    // Store the 26-character ULID string into the variable
+                    const ulid_slice = self.allocator.alloc(u8, 26) catch return RuntimeError.OutOfMemory;
+                    @memcpy(ulid_slice, &ulid_str);
+                    try self.putVariable(var_name, Value{ .alpha = ulid_slice });
+                }
+            }
         } else if (channel.file) |file| {
             // Regular file write (append record)
             _ = file.write(record_data) catch return RuntimeError.FileNotOpen;
@@ -727,27 +754,71 @@ pub const Runtime = struct {
             // Allocate record buffer
             var record_buf: [4096]u8 = undefined;
 
-            if (read_stmt.key) |key_expr| {
-                // Keyed read (READ)
+            // Check for RFA qualifier - read by ULID instead of key
+            var rfa_read = false;
+            var getrfa_var: ?[]const u8 = null;
+            for (read_stmt.qualifiers) |qual| {
+                if (std.ascii.eqlIgnoreCase(qual.name, "RFA")) {
+                    rfa_read = true;
+                } else if (std.ascii.eqlIgnoreCase(qual.name, "GETRFA")) {
+                    if (qual.value) |v| {
+                        if (v == .identifier) {
+                            getrfa_var = v.identifier;
+                        }
+                    }
+                }
+            }
+
+            if (rfa_read and read_stmt.key != null) {
+                // RFA read - key contains ULID string
+                const key_value = try self.evaluateExpression(read_stmt.key.?);
+                const ulid_str = try key_value.toString(self.allocator);
+                defer self.allocator.free(ulid_str);
+
+                const len = isam_file.readByUlidString(ulid_str, &record_buf, .{}) catch |err| {
+                    return switch (err) {
+                        isam.IsamError.InvalidUlid => RuntimeError.InvalidOperation,
+                        isam.IsamError.UlidNotFound => RuntimeError.KeyNotFound,
+                        else => RuntimeError.FileNotOpen,
+                    };
+                };
+
+                // Store record in target variable
+                try self.storeRecordValue(read_stmt.record, record_buf[0..len]);
+
+                // If GETRFA was specified on read, store the ULID into the variable
+                if (getrfa_var) |var_name| {
+                    if (isam_file.getRecordUlidString()) |ulid_str_out| {
+                        const ulid_slice = self.allocator.alloc(u8, 26) catch return RuntimeError.OutOfMemory;
+                        @memcpy(ulid_slice, &ulid_str_out);
+                        try self.putVariable(var_name, Value{ .alpha = ulid_slice });
+                    }
+                }
+            } else if (read_stmt.key) |key_expr| {
+                // Keyed read (READ) - this establishes the key of reference
                 const key_value = try self.evaluateExpression(key_expr);
                 const key_data = try key_value.toString(self.allocator);
                 defer self.allocator.free(key_data);
 
-                // Parse qualifiers for match mode (default to exact for keyed reads)
-                var match_mode: isam.MatchMode = .exact;
-                var key_number: u8 = 0;
+                // Parse qualifiers for match mode and KEYNUM
+                // KEYNUM sets the key of reference for this channel
+                // SynergyDE default match mode is Q_GEQ (greater or equal)
+                var match_mode: isam.MatchMode = .greater_equal;
+                var key_number: u8 = channel.key_of_reference; // Default to current
                 for (read_stmt.qualifiers) |qual| {
-                    if (std.mem.eql(u8, qual.name, "KEYNUM")) {
+                    if (std.ascii.eqlIgnoreCase(qual.name, "KEYNUM")) {
                         if (qual.value) |v| {
                             key_number = @intCast((try self.evaluateExpression(v)).toInteger());
                         }
-                    } else if (std.mem.eql(u8, qual.name, "MATCH")) {
+                    } else if (std.ascii.eqlIgnoreCase(qual.name, "MATCH")) {
                         // Q_EQ, Q_GEQ, Q_GTR, Q_PARTIAL
                         if (qual.value) |v| {
                             const mode_str = try (try self.evaluateExpression(v)).toString(self.allocator);
                             defer self.allocator.free(mode_str);
                             if (std.mem.eql(u8, mode_str, "Q_EQ")) {
                                 match_mode = .exact;
+                            } else if (std.mem.eql(u8, mode_str, "Q_GEQ")) {
+                                match_mode = .greater_equal;
                             } else if (std.mem.eql(u8, mode_str, "Q_GTR")) {
                                 match_mode = .greater;
                             } else if (std.mem.eql(u8, mode_str, "Q_PARTIAL")) {
@@ -756,6 +827,9 @@ pub const Runtime = struct {
                         }
                     }
                 }
+
+                // Set the channel's key of reference (for subsequent READS)
+                channel.key_of_reference = key_number;
 
                 const len = isam_file.read(key_data, &record_buf, .{
                     .key_number = key_number,
@@ -770,14 +844,28 @@ pub const Runtime = struct {
 
                 // Store record in target variable
                 try self.storeRecordValue(read_stmt.record, record_buf[0..len]);
+
+                // If GETRFA was specified on read, store the ULID into the variable
+                if (getrfa_var) |var_name| {
+                    if (isam_file.getRecordUlidString()) |ulid_str| {
+                        const ulid_slice = self.allocator.alloc(u8, 26) catch return RuntimeError.OutOfMemory;
+                        @memcpy(ulid_slice, &ulid_str);
+                        try self.putVariable(var_name, Value{ .alpha = ulid_slice });
+                    }
+                }
             } else {
-                // Sequential read (READS)
-                // Check for KEYNUM qualifier
-                var key_number: u8 = 0;
+                // Sequential read (READS) - uses channel's key of reference
+                // SynergyDE: READS does not have KEYNUM, it uses the key established by READ/FIND
+                // For backward compatibility, still check for KEYNUM but prefer channel state
+                var key_number: u8 = channel.key_of_reference;
+
+                // Backward compatibility: allow KEYNUM on READS (non-standard)
                 for (read_stmt.qualifiers) |qual| {
-                    if (std.mem.eql(u8, qual.name, "KEYNUM")) {
+                    if (std.ascii.eqlIgnoreCase(qual.name, "KEYNUM")) {
                         if (qual.value) |v| {
                             key_number = @intCast((try self.evaluateExpression(v)).toInteger());
+                            // Also update channel's key of reference for consistency
+                            channel.key_of_reference = key_number;
                         }
                     }
                 }
@@ -790,6 +878,15 @@ pub const Runtime = struct {
                 };
 
                 try self.storeRecordValue(read_stmt.record, record_buf[0..len]);
+
+                // If GETRFA was specified on READS, store the ULID into the variable
+                if (getrfa_var) |var_name| {
+                    if (isam_file.getRecordUlidString()) |ulid_str| {
+                        const ulid_slice = self.allocator.alloc(u8, 26) catch return RuntimeError.OutOfMemory;
+                        @memcpy(ulid_slice, &ulid_str);
+                        try self.putVariable(var_name, Value{ .alpha = ulid_slice });
+                    }
+                }
             }
         } else if (channel.file) |file| {
             // Regular file read

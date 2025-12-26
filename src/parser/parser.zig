@@ -539,6 +539,19 @@ pub const Parser = struct {
         };
     }
 
+    /// Check if identifier is a known qualifier name
+    fn isQualifierName(name: []const u8) bool {
+        const qualifier_names = [_][]const u8{
+            "KEYNUM", "LOCK", "WAIT", "MATCH", "GETRFA", "NOFILL",
+            "RFA", "POSITION", "DIRECTION", "MANUAL", "Q_NO_LOCK",
+            "Q_MANUAL_LOCK", "Q_NO_DELETE", "Q_AUTO_LOCK",
+        };
+        for (qualifier_names) |q| {
+            if (std.ascii.eqlIgnoreCase(name, q)) return true;
+        }
+        return false;
+    }
+
     fn parseRead(self: *Self) ParseError!ast.Statement {
         _ = self.advance(); // consume 'read'
 
@@ -551,19 +564,55 @@ pub const Parser = struct {
         // Parse record variable
         const record = try self.parseExpression();
 
-        // Parse optional key
         var key: ?ast.Expression = null;
-        if (self.match(&[_]TokenType{.comma})) {
-            key = try self.parseExpression();
+        var qualifiers: std.ArrayListAligned(ast.Qualifier, null) = .empty;
+        errdefer qualifiers.deinit(self.allocator);
+
+        // Parse remaining comma-separated arguments (key and/or qualifiers)
+        // SynergyDE syntax: READ(channel, record, key, KEYNUM:1, LOCK:Q_AUTO)
+        while (self.match(&[_]TokenType{.comma})) {
+            // Check if this is a qualifier (identifier followed by : or , or ))
+            if (self.peek().type == .identifier) {
+                const name = self.peek().lexeme;
+                if (isQualifierName(name)) {
+                    // This is a qualifier - parse it
+                    _ = self.advance(); // consume qualifier name
+                    var value: ?ast.Expression = null;
+                    if (self.match(&[_]TokenType{.colon})) {
+                        value = try self.parseExpression();
+                    }
+                    try qualifiers.append(self.allocator, .{
+                        .name = name,
+                        .value = value,
+                    });
+                } else {
+                    // This is the key expression
+                    if (key == null) {
+                        key = try self.parseExpression();
+                    } else {
+                        // Already have a key, treat as error or additional expr
+                        _ = try self.parseExpression();
+                    }
+                }
+            } else {
+                // Parse as key expression
+                if (key == null) {
+                    key = try self.parseExpression();
+                } else {
+                    _ = try self.parseExpression();
+                }
+            }
         }
 
         _ = try self.consume(.rparen, "Expected ')' after read arguments");
 
-        // Parse optional qualifiers
-        var qualifiers: std.ArrayListAligned(ast.Qualifier, null) = .empty;
-        errdefer qualifiers.deinit(self.allocator);
-
+        // Also parse bracket-style qualifiers for backward compatibility [KEYNUM:1]
         try self.parseQualifiers(&qualifiers);
+
+        // Parse error list [[eof=label, err=handler]]
+        var error_list: std.ArrayListAligned(ast.ErrorHandler, null) = .empty;
+        errdefer error_list.deinit(self.allocator);
+        try self.parseErrorList(&error_list);
 
         return ast.Statement{
             .read_stmt = .{
@@ -571,6 +620,7 @@ pub const Parser = struct {
                 .record = record,
                 .key = key,
                 .qualifiers = qualifiers.toOwnedSlice(self.allocator) catch return ParseError.OutOfMemory,
+                .error_list = error_list.toOwnedSlice(self.allocator) catch return ParseError.OutOfMemory,
             },
         };
     }
@@ -587,13 +637,42 @@ pub const Parser = struct {
         // Parse record variable
         const record = try self.parseExpression();
 
-        _ = try self.consume(.rparen, "Expected ')' after reads arguments");
-
-        // Parse optional qualifiers
         var qualifiers: std.ArrayListAligned(ast.Qualifier, null) = .empty;
         errdefer qualifiers.deinit(self.allocator);
 
+        // Parse qualifiers inside parentheses (SynergyDE syntax)
+        // READS(channel, record, KEYNUM:1, DIRECTION:Q_FORWARD)
+        while (self.match(&[_]TokenType{.comma})) {
+            if (self.peek().type == .identifier) {
+                const name = self.peek().lexeme;
+                if (isQualifierName(name)) {
+                    _ = self.advance(); // consume qualifier name
+                    var value: ?ast.Expression = null;
+                    if (self.match(&[_]TokenType{.colon})) {
+                        value = try self.parseExpression();
+                    }
+                    try qualifiers.append(self.allocator, .{
+                        .name = name,
+                        .value = value,
+                    });
+                } else {
+                    // Unknown identifier - skip or treat as error
+                    _ = try self.parseExpression();
+                }
+            } else {
+                _ = try self.parseExpression();
+            }
+        }
+
+        _ = try self.consume(.rparen, "Expected ')' after reads arguments");
+
+        // Also parse bracket-style qualifiers for backward compatibility
         try self.parseQualifiers(&qualifiers);
+
+        // Parse error list [[eof=label, err=handler]]
+        var error_list: std.ArrayListAligned(ast.ErrorHandler, null) = .empty;
+        errdefer error_list.deinit(self.allocator);
+        try self.parseErrorList(&error_list);
 
         // READS is like READ but with no key (sequential read)
         return ast.Statement{
@@ -602,6 +681,7 @@ pub const Parser = struct {
                 .record = record,
                 .key = null,
                 .qualifiers = qualifiers.toOwnedSlice(self.allocator) catch return ParseError.OutOfMemory,
+                .error_list = error_list.toOwnedSlice(self.allocator) catch return ParseError.OutOfMemory,
             },
         };
     }
@@ -696,12 +776,34 @@ pub const Parser = struct {
         // Parse record variable
         const record = try self.parseExpression();
 
-        _ = try self.consume(.rparen, "Expected ')' after store arguments");
-
-        // Parse optional qualifiers
+        // Parse optional qualifiers (SynergyDE: inside parentheses before rparen)
+        // Example: store(ch, record, GETRFA:ulid_var)
         var qualifiers: std.ArrayListAligned(ast.Qualifier, null) = .empty;
         errdefer qualifiers.deinit(self.allocator);
 
+        while (self.match(&[_]TokenType{.comma})) {
+            // Check if this looks like a qualifier (identifier followed by optional colon)
+            if (self.peek().type == .identifier and isQualifierName(self.peek().lexeme)) {
+                const name = self.advance().lexeme;
+                var value: ?ast.Expression = null;
+
+                if (self.match(&[_]TokenType{.colon})) {
+                    value = try self.parseExpression();
+                }
+
+                try qualifiers.append(self.allocator, .{
+                    .name = name,
+                    .value = value,
+                });
+            } else {
+                // Not a qualifier, backtrack and break
+                break;
+            }
+        }
+
+        _ = try self.consume(.rparen, "Expected ')' after store arguments");
+
+        // Also parse bracket-style qualifiers after rparen for backward compatibility
         try self.parseQualifiers(&qualifiers);
 
         return ast.Statement{
@@ -763,6 +865,51 @@ pub const Parser = struct {
         }
 
         _ = try self.consume(.rbracket, "Expected ']' after qualifiers");
+    }
+
+    /// Parse error list [[eof=label, err=handler, locked=wait_handler]]
+    /// SynergyDE syntax: [[error_type=label, ...]]
+    fn parseErrorList(self: *Self, error_list: *std.ArrayListAligned(ast.ErrorHandler, null)) ParseError!void {
+        // Check for [[ opening
+        if (!self.match(&[_]TokenType{.lbracket})) {
+            return;
+        }
+        if (!self.match(&[_]TokenType{.lbracket})) {
+            // Single [ was consumed but no second [, this might be a qualifier
+            // Backtrack isn't easy, so we'll just parse as empty and return
+            // In practice this shouldn't happen if parseQualifiers was called first
+            _ = try self.consume(.rbracket, "Expected ']'");
+            return;
+        }
+
+        while (true) {
+            // Expect identifier for error type (eof, err, locked, etc.)
+            if (self.peek().type != .identifier) {
+                break;
+            }
+
+            const error_type = self.advance().lexeme;
+
+            // Expect = after error type
+            _ = try self.consume(.equals, "Expected '=' after error type");
+
+            // Expect label identifier
+            const label_tok = try self.consume(.identifier, "Expected label after '='");
+            const label = label_tok.lexeme;
+
+            try error_list.append(self.allocator, .{
+                .error_type = error_type,
+                .label = label,
+            });
+
+            // Continue if there's a comma
+            if (!self.match(&[_]TokenType{.comma})) {
+                break;
+            }
+        }
+
+        _ = try self.consume(.rbracket, "Expected ']]' after error list");
+        _ = try self.consume(.rbracket, "Expected ']]' after error list");
     }
 
     // ============================================================
