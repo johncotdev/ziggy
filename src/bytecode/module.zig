@@ -1,14 +1,19 @@
 //! Zibol Bytecode Module Format
 //!
-//! Defines the structure of compiled bytecode modules (.zbc files).
+//! Defines the structure of compiled bytecode modules.
+//!
+//! File extensions (following SynergyDE conventions):
+//!   .zbo - compiled object file (equivalent to SynergyDE .dbo)
+//!   .zlb - executable library (equivalent to SynergyDE .elb)
+//!   .zbr - mainline application (equivalent to SynergyDE .dbr)
 
 const std = @import("std");
 const Opcode = @import("opcodes.zig").Opcode;
 
 /// Magic numbers for file identification
-pub const MAGIC_MODULE = [4]u8{ 'Z', 'B', 'C', '1' };
-pub const MAGIC_LIBRARY = [4]u8{ 'Z', 'B', 'L', '1' };
-pub const MAGIC_EXECUTABLE = [4]u8{ 'Z', 'B', 'X', '1' };
+pub const MAGIC_MODULE = [4]u8{ 'Z', 'B', 'O', '1' }; // .zbo object file
+pub const MAGIC_LIBRARY = [4]u8{ 'Z', 'L', 'B', '1' }; // .zlb library
+pub const MAGIC_EXECUTABLE = [4]u8{ 'Z', 'B', 'R', '1' }; // .zbr executable
 
 /// Current bytecode version
 pub const VERSION_MAJOR: u16 = 0;
@@ -332,7 +337,12 @@ pub const Module = struct {
             }
             self.allocator.free(self.constants);
         }
-        if (self.types.len > 0) self.allocator.free(self.types);
+        if (self.types.len > 0) {
+            for (self.types) |ty| {
+                if (ty.fields.len > 0) self.allocator.free(ty.fields);
+            }
+            self.allocator.free(self.types);
+        }
         if (self.routines.len > 0) self.allocator.free(self.routines);
         if (self.code.len > 0) self.allocator.free(self.code);
         if (self.exports.len > 0) self.allocator.free(self.exports);

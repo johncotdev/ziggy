@@ -151,7 +151,8 @@ pub const Parser = struct {
     fn parseRecord(self: *Self) ParseError!ast.Statement {
         _ = self.advance(); // consume 'record'
 
-        const name: ?[]const u8 = if (self.check(.identifier))
+        // A record name is an identifier NOT followed by comma (fields have comma after name)
+        const name: ?[]const u8 = if (self.check(.identifier) and !self.checkNext(.comma))
             self.advance().lexeme
         else
             null;
@@ -1383,6 +1384,11 @@ pub const Parser = struct {
     fn check(self: *const Self, token_type: TokenType) bool {
         if (self.isAtEnd()) return false;
         return self.peek().type == token_type;
+    }
+
+    fn checkNext(self: *const Self, token_type: TokenType) bool {
+        if (self.current + 1 >= self.tokens.len) return false;
+        return self.tokens[self.current + 1].type == token_type;
     }
 
     fn checkEndOfStatement(self: *const Self) bool {

@@ -1,6 +1,6 @@
-; hello.dbl - A simple Ziggy DBL example
+; hello.zbl - A simple Zibol example
 ;
-; This is a basic "Hello, World" program in DBL
+; This is a basic "Hello, World" program in Zibol
 
 record
     name        ,a30

@@ -90,10 +90,10 @@ pub const Stdlib = struct {
         var dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch return;
         defer dir.close();
 
-        // Iterate through .zbc files
+        // Iterate through .zbo files
         var iter = dir.iterate();
         while (iter.next() catch return) |entry| {
-            if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".zbc")) {
+            if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".zbo")) {
                 // Load the module
                 var path_buf: [512]u8 = undefined;
                 const full_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ path, entry.name }) catch continue;

@@ -40,10 +40,27 @@ pub const Lowerer = struct {
     /// Map field names to their offsets within the current record context
     field_offsets: std.StringHashMap(FieldInfo),
 
+    /// Map label names to their IR blocks
+    labels: std.StringHashMap(*ir.Block),
+
+    /// Pending goto statements that need label resolution
+    pending_gotos: std.ArrayList(PendingGoto),
+
+    /// Allocated Type pointers that need to be freed on deinit
+    allocated_types: std.ArrayList(*ir.Type),
+
+    /// Allocated Value slices that need to be freed on deinit
+    allocated_value_slices: std.ArrayList([]const ir.Value),
+
     const FieldInfo = struct {
         ty: ir.Type,
         offset: u32,
         index: u32,
+    };
+
+    const PendingGoto = struct {
+        from_block: *ir.Block,
+        label_name: []const u8,
     };
 
     const Self = @This();
@@ -60,6 +77,10 @@ pub const Lowerer = struct {
             .variables = std.StringHashMap(ir.Value).init(allocator),
             .record_types = std.StringHashMap(*const ir.RecordType).init(allocator),
             .field_offsets = std.StringHashMap(FieldInfo).init(allocator),
+            .labels = std.StringHashMap(*ir.Block).init(allocator),
+            .pending_gotos = .{},
+            .allocated_types = .{},
+            .allocated_value_slices = .{},
         };
     }
 
@@ -67,6 +88,20 @@ pub const Lowerer = struct {
         self.variables.deinit();
         self.record_types.deinit();
         self.field_offsets.deinit();
+        self.labels.deinit();
+        self.pending_gotos.deinit(self.allocator);
+
+        // Free allocated Type pointers
+        for (self.allocated_types.items) |ty_ptr| {
+            self.allocator.destroy(ty_ptr);
+        }
+        self.allocated_types.deinit(self.allocator);
+
+        // Free allocated Value slices
+        for (self.allocated_value_slices.items) |slice| {
+            self.allocator.free(slice);
+        }
+        self.allocated_value_slices.deinit(self.allocator);
         // Note: module is returned to caller, not freed here
     }
 
@@ -75,7 +110,9 @@ pub const Lowerer = struct {
         // First pass: collect record definitions
         for (program.statements) |stmt| {
             switch (stmt) {
-                .record => |rec| try self.lowerRecordDef(&rec),
+                .record => |rec| {
+                    try self.lowerRecordDef(&rec);
+                },
                 else => {},
             }
         }
@@ -92,8 +129,8 @@ pub const Lowerer = struct {
         // Third pass: create a main function for procedural code
         // In Zibol, code after PROC runs as the main entry point
         var in_proc = false;
-        var proc_statements = std.ArrayList(ast.Statement).init(self.allocator);
-        defer proc_statements.deinit();
+        var proc_statements: std.ArrayList(ast.Statement) = .{};
+        defer proc_statements.deinit(self.allocator);
 
         for (program.statements) |stmt| {
             switch (stmt) {
@@ -105,7 +142,7 @@ pub const Lowerer = struct {
                 },
                 else => {
                     if (in_proc) {
-                        try proc_statements.append(stmt);
+                        try proc_statements.append(self.allocator, stmt);
                     }
                 },
             }
@@ -121,8 +158,8 @@ pub const Lowerer = struct {
 
     /// Lower a record definition to an IR record type
     fn lowerRecordDef(self: *Self, rec: *const ast.RecordDef) LowerError!void {
-        var fields = std.ArrayList(ir.RecordType.Field).init(self.allocator);
-        errdefer fields.deinit();
+        var fields: std.ArrayList(ir.RecordType.Field) = .{};
+        errdefer fields.deinit(self.allocator);
 
         var offset: u32 = 0;
         var field_index: u32 = 0;
@@ -131,7 +168,7 @@ pub const Lowerer = struct {
             const ir_type = try self.lowerDataType(&field.data_type);
             const field_size = ir_type.sizeInBytes();
 
-            try fields.append(.{
+            try fields.append(self.allocator, .{
                 .name = field.name,
                 .ty = ir_type,
                 .offset = offset,
@@ -151,7 +188,7 @@ pub const Lowerer = struct {
         const record_type = try self.allocator.create(ir.RecordType);
         record_type.* = .{
             .name = rec.name orelse "anonymous",
-            .fields = fields.toOwnedSlice() catch return LowerError.OutOfMemory,
+            .fields = fields.toOwnedSlice(self.allocator) catch return LowerError.OutOfMemory,
             .size = offset,
         };
 
@@ -159,6 +196,14 @@ pub const Lowerer = struct {
 
         if (rec.name) |name| {
             try self.record_types.put(name, record_type);
+
+            // In DBL, a named record also creates a variable of that record type
+            // Add it to field_offsets so it gets a variable in createMainFunction
+            try self.field_offsets.put(name, .{
+                .ty = ir.Type{ .record = record_type },
+                .offset = 0, // Record variables don't have an offset in the parent
+                .index = 0,
+            });
         }
     }
 
@@ -179,7 +224,13 @@ pub const Lowerer = struct {
         while (iter.next()) |entry| {
             const name = entry.key_ptr.*;
             const info = entry.value_ptr.*;
-            const alloca_result = func.newValue(.{ .ptr = &info.ty });
+
+            // Allocate the type on the heap for stable pointer
+            const ty_ptr = try self.allocator.create(ir.Type);
+            ty_ptr.* = info.ty;
+            try self.allocated_types.append(self.allocator, ty_ptr);
+
+            const alloca_result = func.newValue(.{ .ptr = ty_ptr });
 
             try self.emit(.{
                 .alloca = .{
@@ -202,18 +253,21 @@ pub const Lowerer = struct {
             try self.emit(.{ .ret = null });
         }
 
+        // Resolve any forward goto references
+        try self.resolvePendingGotos();
+
         try self.module.addFunction(func);
     }
 
     /// Lower a function definition to IR
     fn lowerFunctionDef(self: *Self, func_def: *const ast.FunctionDef) LowerError!void {
         // Build parameter list
-        var params = std.ArrayList(ir.FunctionType.Param).init(self.allocator);
-        defer params.deinit();
+        var params: std.ArrayList(ir.FunctionType.Param) = .{};
+        defer params.deinit(self.allocator);
 
         for (func_def.parameters) |param| {
             const ir_type = try self.lowerDataType(&param.data_type);
-            try params.append(.{
+            try params.append(self.allocator, .{
                 .name = param.name,
                 .ty = ir_type,
                 .direction = .in, // Default to input parameter
@@ -223,7 +277,7 @@ pub const Lowerer = struct {
         const return_type = try self.lowerDataType(&func_def.return_type);
 
         const sig = ir.FunctionType{
-            .params = params.toOwnedSlice() catch return LowerError.OutOfMemory,
+            .params = params.toOwnedSlice(self.allocator) catch return LowerError.OutOfMemory,
             .return_type = return_type,
             .is_variadic = false,
         };
@@ -256,6 +310,10 @@ pub const Lowerer = struct {
             try self.variables.put(param.name, alloca_result);
         }
 
+        // Clear labels for this function scope
+        self.labels.clearRetainingCapacity();
+        self.pending_gotos.clearRetainingCapacity();
+
         // Lower body statements
         for (func_def.body) |stmt| {
             try self.lowerStatement(&stmt);
@@ -266,18 +324,21 @@ pub const Lowerer = struct {
             try self.emit(.{ .ret = null });
         }
 
+        // Resolve any forward goto references
+        try self.resolvePendingGotos();
+
         try self.module.addFunction(func);
     }
 
     /// Lower a subroutine definition to IR
     fn lowerSubroutineDef(self: *Self, sub_def: *const ast.SubroutineDef) LowerError!void {
         // Build parameter list
-        var params = std.ArrayList(ir.FunctionType.Param).init(self.allocator);
-        defer params.deinit();
+        var params: std.ArrayList(ir.FunctionType.Param) = .{};
+        defer params.deinit(self.allocator);
 
         for (sub_def.parameters) |param| {
             const ir_type = try self.lowerDataType(&param.data_type);
-            try params.append(.{
+            try params.append(self.allocator, .{
                 .name = param.name,
                 .ty = ir_type,
                 .direction = .inout, // Subroutine params are typically inout
@@ -285,7 +346,7 @@ pub const Lowerer = struct {
         }
 
         const sig = ir.FunctionType{
-            .params = params.toOwnedSlice() catch return LowerError.OutOfMemory,
+            .params = params.toOwnedSlice(self.allocator) catch return LowerError.OutOfMemory,
             .return_type = .void,
             .is_variadic = false,
         };
@@ -318,6 +379,10 @@ pub const Lowerer = struct {
             try self.variables.put(param.name, alloca_result);
         }
 
+        // Clear labels for this subroutine scope
+        self.labels.clearRetainingCapacity();
+        self.pending_gotos.clearRetainingCapacity();
+
         // Lower body statements
         for (sub_def.body) |stmt| {
             try self.lowerStatement(&stmt);
@@ -327,6 +392,9 @@ pub const Lowerer = struct {
         if (!self.current_block.?.isTerminated()) {
             try self.emit(.{ .ret = null });
         }
+
+        // Resolve any forward goto references
+        try self.resolvePendingGotos();
 
         try self.module.addFunction(func);
     }
@@ -357,16 +425,11 @@ pub const Lowerer = struct {
                 // Expression statement - evaluate for side effects
                 _ = try self.lowerExpression(&e);
             },
-            .label => {
-                // Labels become basic blocks
-                // TODO: Implement label handling
-            },
-            .goto_stmt, .call => {
-                // Control flow - TODO
-            },
-            .loop, .case_stmt => {
-                // Complex control flow - TODO
-            },
+            .label => |l| try self.lowerLabel(&l),
+            .goto_stmt => |g| try self.lowerGoto(&g),
+            .call => |c| try self.lowerCall(&c),
+            .loop => |lp| try self.lowerLoop(&lp),
+            .case_stmt => |cs| try self.lowerCase(&cs),
             else => {
                 // Skip unsupported statements for now
             },
@@ -402,18 +465,21 @@ pub const Lowerer = struct {
     fn lowerDisplay(self: *Self, d: *const ast.DisplayStatement) LowerError!void {
         const channel = try self.lowerExpression(&d.channel);
 
-        var values = std.ArrayList(ir.Value).init(self.allocator);
-        defer values.deinit();
+        var values: std.ArrayList(ir.Value) = .{};
+        errdefer values.deinit(self.allocator);
 
         for (d.expressions) |expr| {
             const val = try self.lowerExpression(&expr);
-            try values.append(val);
+            try values.append(self.allocator, val);
         }
+
+        const values_slice = values.toOwnedSlice(self.allocator) catch return LowerError.OutOfMemory;
+        try self.allocated_value_slices.append(self.allocator, values_slice);
 
         try self.emit(.{
             .io_display = .{
                 .channel = channel,
-                .values = values.toOwnedSlice() catch return LowerError.OutOfMemory,
+                .values = values_slice,
             },
         });
     }
@@ -462,18 +528,21 @@ pub const Lowerer = struct {
 
     /// Lower an xcall statement
     fn lowerXCall(self: *Self, x: *const ast.XCallStatement) LowerError!void {
-        var args = std.ArrayList(ir.Value).init(self.allocator);
-        defer args.deinit();
+        var args: std.ArrayList(ir.Value) = .{};
+        errdefer args.deinit(self.allocator);
 
         for (x.arguments) |arg| {
             const val = try self.lowerExpression(&arg);
-            try args.append(val);
+            try args.append(self.allocator, val);
         }
+
+        const args_slice = args.toOwnedSlice(self.allocator) catch return LowerError.OutOfMemory;
+        try self.allocated_value_slices.append(self.allocator, args_slice);
 
         try self.emit(.{
             .xcall = .{
                 .routine = x.routine_name,
-                .args = args.toOwnedSlice() catch return LowerError.OutOfMemory,
+                .args = args_slice,
             },
         });
     }
@@ -679,6 +748,286 @@ pub const Lowerer = struct {
         });
     }
 
+    /// Lower a label definition - creates a new basic block
+    fn lowerLabel(self: *Self, l: *const ast.LabelDef) LowerError!void {
+        const func = self.current_func orelse return LowerError.UnsupportedFeature;
+
+        // Create a new block for this label
+        const label_block = func.createBlock(l.name) catch return LowerError.OutOfMemory;
+
+        // If current block isn't terminated, branch to the label block
+        if (!self.current_block.?.isTerminated()) {
+            try self.emit(.{ .br = .{ .target = label_block } });
+        }
+
+        // Register the label
+        try self.labels.put(l.name, label_block);
+
+        // Continue emitting code in the label block
+        self.current_block = label_block;
+    }
+
+    /// Lower a goto statement
+    fn lowerGoto(self: *Self, g: *const ast.GotoStatement) LowerError!void {
+        // Check if label is already defined
+        if (self.labels.get(g.label)) |target_block| {
+            // Label exists, emit direct branch
+            try self.emit(.{ .br = .{ .target = target_block } });
+        } else {
+            // Forward reference - record for later resolution
+            try self.pending_gotos.append(self.allocator, .{
+                .from_block = self.current_block.?,
+                .label_name = g.label,
+            });
+            // We'll need to patch this later when the label is defined
+        }
+    }
+
+    /// Lower a call statement (internal subroutine call)
+    fn lowerCall(self: *Self, c: *const ast.CallStatement) LowerError!void {
+        // CALL jumps to a label and returns
+        // For now, treat it like a goto (will need proper call/return semantics later)
+        if (self.labels.get(c.label)) |target_block| {
+            try self.emit(.{ .br = .{ .target = target_block } });
+        } else {
+            try self.pending_gotos.append(self.allocator, .{
+                .from_block = self.current_block.?,
+                .label_name = c.label,
+            });
+        }
+    }
+
+    /// Lower a loop statement
+    fn lowerLoop(self: *Self, lp: *const ast.LoopStatement) LowerError!void {
+        const func = self.current_func orelse return LowerError.UnsupportedFeature;
+
+        // Create blocks for loop structure
+        const cond_block = func.createBlock("loop_cond") catch return LowerError.OutOfMemory;
+        const body_block = func.createBlock("loop_body") catch return LowerError.OutOfMemory;
+        const exit_block = func.createBlock("loop_exit") catch return LowerError.OutOfMemory;
+
+        // Handle initialization if present (FOR loops)
+        if (lp.init_expr) |init_expr| {
+            // If it's an assignment expression, evaluate it
+            _ = try self.lowerExpression(&init_expr);
+        }
+
+        switch (lp.loop_type) {
+            .do_forever => {
+                // DO FOREVER - no condition, just loop
+                try self.emit(.{ .br = .{ .target = body_block } });
+
+                self.current_block = body_block;
+                try self.lowerStatement(lp.body);
+                if (!self.current_block.?.isTerminated()) {
+                    try self.emit(.{ .br = .{ .target = body_block } });
+                }
+
+                self.current_block = exit_block;
+            },
+            .do_until => {
+                // DO body UNTIL condition
+                // Execute body first, then check condition
+                try self.emit(.{ .br = .{ .target = body_block } });
+
+                self.current_block = body_block;
+                try self.lowerStatement(lp.body);
+                if (!self.current_block.?.isTerminated()) {
+                    try self.emit(.{ .br = .{ .target = cond_block } });
+                }
+
+                self.current_block = cond_block;
+                if (lp.condition) |cond| {
+                    const condition = try self.lowerExpression(&cond);
+                    // Until means exit when true
+                    try self.emit(.{
+                        .cond_br = .{
+                            .condition = condition,
+                            .then_block = exit_block,
+                            .else_block = body_block,
+                        },
+                    });
+                }
+
+                self.current_block = exit_block;
+            },
+            .while_loop => {
+                // WHILE condition DO body
+                try self.emit(.{ .br = .{ .target = cond_block } });
+
+                self.current_block = cond_block;
+                if (lp.condition) |cond| {
+                    const condition = try self.lowerExpression(&cond);
+                    try self.emit(.{
+                        .cond_br = .{
+                            .condition = condition,
+                            .then_block = body_block,
+                            .else_block = exit_block,
+                        },
+                    });
+                }
+
+                self.current_block = body_block;
+                try self.lowerStatement(lp.body);
+                if (!self.current_block.?.isTerminated()) {
+                    try self.emit(.{ .br = .{ .target = cond_block } });
+                }
+
+                self.current_block = exit_block;
+            },
+            .for_from_thru, .for_do => {
+                // FOR var FROM start THRU end [BY step]
+                try self.emit(.{ .br = .{ .target = cond_block } });
+
+                self.current_block = cond_block;
+                if (lp.condition) |cond| {
+                    const condition = try self.lowerExpression(&cond);
+                    try self.emit(.{
+                        .cond_br = .{
+                            .condition = condition,
+                            .then_block = body_block,
+                            .else_block = exit_block,
+                        },
+                    });
+                } else {
+                    try self.emit(.{ .br = .{ .target = body_block } });
+                }
+
+                self.current_block = body_block;
+                try self.lowerStatement(lp.body);
+
+                // Update expression (increment/decrement)
+                if (lp.update_expr) |update| {
+                    _ = try self.lowerExpression(&update);
+                }
+
+                if (!self.current_block.?.isTerminated()) {
+                    try self.emit(.{ .br = .{ .target = cond_block } });
+                }
+
+                self.current_block = exit_block;
+            },
+            .foreach => {
+                // FOREACH - iterate over collection
+                // For now, treat like a while loop with the condition
+                try self.emit(.{ .br = .{ .target = cond_block } });
+
+                self.current_block = cond_block;
+                if (lp.condition) |cond| {
+                    const condition = try self.lowerExpression(&cond);
+                    try self.emit(.{
+                        .cond_br = .{
+                            .condition = condition,
+                            .then_block = body_block,
+                            .else_block = exit_block,
+                        },
+                    });
+                }
+
+                self.current_block = body_block;
+                try self.lowerStatement(lp.body);
+                if (!self.current_block.?.isTerminated()) {
+                    try self.emit(.{ .br = .{ .target = cond_block } });
+                }
+
+                self.current_block = exit_block;
+            },
+        }
+    }
+
+    /// Lower a case statement (USING/CASE)
+    fn lowerCase(self: *Self, cs: *const ast.CaseStatement) LowerError!void {
+        const func = self.current_func orelse return LowerError.UnsupportedFeature;
+
+        // Evaluate the selector expression
+        const selector = try self.lowerExpression(&cs.selector);
+
+        // Create exit block
+        const exit_block = func.createBlock("case_exit") catch return LowerError.OutOfMemory;
+
+        // Create blocks for each case
+        var case_blocks: std.ArrayList(*ir.Block) = .{};
+        defer case_blocks.deinit(self.allocator);
+
+        for (cs.cases) |_| {
+            const case_block = func.createBlock("case") catch return LowerError.OutOfMemory;
+            try case_blocks.append(self.allocator, case_block);
+        }
+
+        // Create default block if present
+        const default_block = if (cs.default_branch != null)
+            func.createBlock("case_default") catch return LowerError.OutOfMemory
+        else
+            exit_block;
+
+        // Emit comparison chain
+        for (cs.cases, 0..) |case_branch, i| {
+            for (case_branch.values) |val| {
+                const case_val = try self.lowerExpression(&val);
+
+                // Compare selector with case value
+                const cmp_result = func.newValue(.{ .integer = 1 });
+                try self.emit(.{
+                    .cmp_eq = .{
+                        .lhs = selector,
+                        .rhs = case_val,
+                        .result = cmp_result,
+                    },
+                });
+
+                // Create next check block
+                const next_check = if (i + 1 < cs.cases.len)
+                    func.createBlock("case_check") catch return LowerError.OutOfMemory
+                else
+                    default_block;
+
+                try self.emit(.{
+                    .cond_br = .{
+                        .condition = cmp_result,
+                        .then_block = case_blocks.items[i],
+                        .else_block = next_check,
+                    },
+                });
+
+                self.current_block = next_check;
+            }
+        }
+
+        // Emit case bodies
+        for (cs.cases, 0..) |case_branch, i| {
+            self.current_block = case_blocks.items[i];
+            try self.lowerStatement(case_branch.body);
+            if (!self.current_block.?.isTerminated()) {
+                try self.emit(.{ .br = .{ .target = exit_block } });
+            }
+        }
+
+        // Emit default body if present
+        if (cs.default_branch) |default_stmt| {
+            self.current_block = default_block;
+            try self.lowerStatement(default_stmt);
+            if (!self.current_block.?.isTerminated()) {
+                try self.emit(.{ .br = .{ .target = exit_block } });
+            }
+        }
+
+        self.current_block = exit_block;
+    }
+
+    /// Resolve any pending goto statements after all labels are defined
+    fn resolvePendingGotos(self: *Self) LowerError!void {
+        for (self.pending_gotos.items) |pending| {
+            if (self.labels.get(pending.label_name)) |target_block| {
+                // Patch the branch in the from_block
+                pending.from_block.append(.{ .br = .{ .target = target_block } }) catch return LowerError.OutOfMemory;
+            } else {
+                // Undefined label - error
+                return LowerError.UndefinedVariable;
+            }
+        }
+        self.pending_gotos.clearRetainingCapacity();
+    }
+
     /// Lower an expression to an IR value
     fn lowerExpression(self: *Self, expr: *const ast.Expression) LowerError!ir.Value {
         const func = self.current_func orelse return LowerError.UnsupportedFeature;
@@ -718,7 +1067,7 @@ pub const Lowerer = struct {
             },
             .identifier => |name| {
                 if (self.variables.get(name)) |ptr| {
-                    // Load the variable
+                    // Load the variable (includes named records which are added to variables)
                     const field_info = self.field_offsets.get(name);
                     const ty = if (field_info) |info| info.ty else ptr.ty;
                     const result = func.newValue(ty);
@@ -775,19 +1124,19 @@ pub const Lowerer = struct {
                 return self.lowerExpression(g);
             },
             .call => |c| {
-                var args = std.ArrayList(ir.Value).init(self.allocator);
-                defer args.deinit();
+                var args: std.ArrayList(ir.Value) = .{};
+                defer args.deinit(self.allocator);
 
                 for (c.arguments) |arg| {
                     const val = try self.lowerExpression(&arg);
-                    try args.append(val);
+                    try args.append(self.allocator, val);
                 }
 
                 const result = func.newValue(.void);
                 try self.emit(.{
                     .call = .{
                         .callee = c.callee,
-                        .args = args.toOwnedSlice() catch return LowerError.OutOfMemory,
+                        .args = args.toOwnedSlice(self.allocator) catch return LowerError.OutOfMemory,
                         .result = result,
                     },
                 });

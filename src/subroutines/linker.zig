@@ -1,6 +1,6 @@
 //! Zibol Module Linker
 //!
-//! Loads compiled bytecode modules (.zbc files) and links their
+//! Loads compiled bytecode modules (.zbo files) and links their
 //! exported subroutines into the runtime environment.
 
 const std = @import("std");
@@ -47,9 +47,9 @@ pub const SearchPaths = struct {
             return name;
         } else |_| {}
 
-        // Try with .zbc extension
+        // Try with .zbo extension
         var buf: [512]u8 = undefined;
-        const with_ext = std.fmt.bufPrint(&buf, "{s}.zbc", .{name}) catch return null;
+        const with_ext = std.fmt.bufPrint(&buf, "{s}.zbo", .{name}) catch return null;
 
         if (std.fs.cwd().access(with_ext, .{})) {
             return with_ext;
@@ -57,8 +57,8 @@ pub const SearchPaths = struct {
 
         // Search in configured paths
         for (self.paths.items) |search_path| {
-            // Try path/name.zbc
-            const full_path = std.fmt.bufPrint(&buf, "{s}/{s}.zbc", .{ search_path, name }) catch continue;
+            // Try path/name.zbo
+            const full_path = std.fmt.bufPrint(&buf, "{s}/{s}.zbo", .{ search_path, name }) catch continue;
 
             if (std.fs.cwd().access(full_path, .{})) {
                 return full_path;
@@ -208,7 +208,7 @@ pub const Linker = struct {
     pub fn loadModuleFromPath(self: *Self, path: []const u8) LinkerError!*LinkedModule {
         // Extract module name from path
         const base = std.fs.path.basename(path);
-        const name = if (std.mem.endsWith(u8, base, ".zbc"))
+        const name = if (std.mem.endsWith(u8, base, ".zbo"))
             base[0 .. base.len - 4]
         else
             base;

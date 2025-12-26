@@ -510,8 +510,18 @@ pub const Module = struct {
             func.deinit();
         }
         self.functions.deinit(self.allocator);
+
+        // Free record types and their fields
+        for (self.records.items) |record| {
+            self.allocator.free(record.fields);
+            self.allocator.destroy(record);
+        }
         self.records.deinit(self.allocator);
+
         self.globals.deinit(self.allocator);
+
+        // Destroy the module itself
+        self.allocator.destroy(self);
     }
 
     /// Get all exported functions

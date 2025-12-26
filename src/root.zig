@@ -34,6 +34,7 @@ pub const ir = @import("ir/ir.zig");
 pub const ir_lower = @import("ir/lower.zig");
 pub const ir_printer = @import("ir/printer.zig");
 pub const ir_emit_zig = @import("ir/emit_zig.zig");
+pub const ir_emit_bytecode = @import("ir/emit_bytecode.zig");
 
 // Subroutine registry
 pub const subroutines = @import("subroutines/subroutines.zig");
@@ -63,11 +64,48 @@ pub fn run(allocator: std.mem.Allocator, source: []const u8) !void {
     try rt.execute(program);
 }
 
-/// Compile Zibol source to bytecode (future)
-pub fn compile(allocator: std.mem.Allocator, source: []const u8) ![]const u8 {
-    _ = allocator;
-    _ = source;
-    @panic("Bytecode compilation not yet implemented");
+/// Compile Zibol source to bytecode using the IR pipeline
+pub fn compileToModule(allocator: std.mem.Allocator, source: []const u8, module_name: []const u8) !bytecode.Module {
+    // Tokenize
+    var lex = lexer.Lexer.init(source);
+    const tokens = try lex.tokenize(allocator);
+    defer allocator.free(tokens);
+
+    // Parse
+    var parse = parser.Parser.init(allocator, tokens);
+    defer parse.deinit();
+    var program = try parse.parse();
+    defer program.deinit(allocator);
+
+    // Lower to IR
+    var lowerer = try ir_lower.Lowerer.init(allocator, module_name);
+    defer lowerer.deinit();
+    var ir_module = try lowerer.lowerProgram(&program);
+    defer ir_module.deinit();
+
+    // Emit bytecode from IR
+    var emitter = ir_emit_bytecode.BytecodeEmitter.init(allocator);
+    defer emitter.deinit();
+    return try emitter.emit(&ir_module);
+}
+
+/// Lower Zibol source to IR (for debugging/inspection)
+pub fn lowerToIR(allocator: std.mem.Allocator, source: []const u8, module_name: []const u8) !ir.Module {
+    // Tokenize
+    var lex = lexer.Lexer.init(source);
+    const tokens = try lex.tokenize(allocator);
+    defer allocator.free(tokens);
+
+    // Parse
+    var parse = parser.Parser.init(allocator, tokens);
+    defer parse.deinit();
+    var program = try parse.parse();
+    defer program.deinit(allocator);
+
+    // Lower to IR
+    var lowerer = try ir_lower.Lowerer.init(allocator, module_name);
+    defer lowerer.deinit();
+    return try lowerer.lowerProgram(&program);
 }
 
 test "library version" {

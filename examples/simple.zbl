@@ -1,0 +1,9 @@
+; simple.zbl - minimal test
+
+record
+    x ,d5
+endrecord
+
+proc
+    x = 42
+end
